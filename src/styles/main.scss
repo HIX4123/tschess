@@ -1,3 +1,634 @@
 @use './mixins.scss' as *;
 @use './variables.scss' as *;
 @use './reset.scss';
+
+:root {
+  --app-padding: clamp(12px, 2.5vw, 28px);
+  --page: #f3eee3;
+  --ink: #20252b;
+  --muted: #66716f;
+  --line: #c9c0b1;
+  --panel: #fffaf0;
+  --button: #263a3c;
+  --button-text: #ffffff;
+  --accent: #b94b36;
+  --light-square: #eadbb7;
+  --dark-square: #5f8a65;
+  --last-move: #e0b84b;
+  --legal: #264f8f;
+  --capture: #b83232;
+  --shadow: 0 18px 42px rgb(36 31 24 / 18%);
+}
+
+.chess-app {
+  --board-max-size: min(68dvh, 620px);
+
+  height: 100dvh;
+  display: grid;
+  grid-template-columns:
+    minmax(210px, 260px)
+    minmax(320px, var(--board-max-size))
+    minmax(104px, 132px)
+    minmax(240px, 310px);
+  gap: clamp(10px, 1.4vw, 20px);
+  align-items: stretch;
+  justify-content: center;
+  overflow: hidden;
+  padding: var(--app-padding);
+  background: var(--page);
+  color: var(--ink);
+}
+
+.board-stage {
+  width: min(100%, var(--board-max-size), calc(100dvh - (var(--app-padding) * 2)));
+  align-self: center;
+  justify-self: center;
+}
+
+.clock-panel {
+  width: 100%;
+  height: min(var(--board-max-size), calc(100dvh - (var(--app-padding) * 2)));
+  min-width: 0;
+  min-height: 0;
+  align-self: center;
+  justify-self: stretch;
+  display: flex;
+}
+
+.chess-board {
+  width: 100%;
+  aspect-ratio: 1;
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  overflow: hidden;
+  border: 3px solid #2e3a32;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  background: #2e3a32;
+}
+
+.board-square {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+  transition:
+    box-shadow 140ms ease,
+    filter 140ms ease,
+    transform 140ms ease;
+}
+
+.board-square:not(:disabled):hover {
+  filter: brightness(1.05);
+}
+
+.board-square.is-light {
+  background: var(--light-square);
+}
+
+.board-square.is-dark {
+  background: var(--dark-square);
+}
+
+.board-square.is-selected {
+  box-shadow: inset 0 0 0 4px var(--legal);
+}
+
+.board-square.is-last-move {
+  box-shadow: inset 0 0 0 4px rgb(224 184 75 / 76%);
+}
+
+.board-square.is-selected.is-last-move {
+  box-shadow:
+    inset 0 0 0 4px var(--legal),
+    inset 0 0 0 8px rgb(224 184 75 / 68%);
+}
+
+.board-square.is-legal::after,
+.board-square.is-capture::after {
+  position: absolute;
+  z-index: 1;
+  content: '';
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+.board-square.is-legal::after {
+  width: 28%;
+  height: 28%;
+  background: rgb(38 79 143 / 42%);
+}
+
+.board-square.is-capture::after {
+  inset: 12%;
+  border: max(3px, 0.45vmin) solid rgb(184 50 50 / 74%);
+}
+
+.board-square.is-check {
+  box-shadow: inset 0 0 0 5px var(--capture);
+}
+
+.chess-board.is-locked .board-square {
+  filter: saturate(0.86);
+}
+
+.piece {
+  z-index: 2;
+  display: block;
+  font-size: clamp(2rem, 7.8vmin, 5rem);
+  line-height: 1;
+  text-shadow: 0 2px 6px rgb(0 0 0 / 20%);
+  user-select: none;
+}
+
+.coordinate {
+  position: absolute;
+  z-index: 3;
+  font-size: clamp(0.58rem, 1.4vmin, 0.76rem);
+  font-weight: 800;
+  line-height: 1;
+  opacity: 0.72;
+  pointer-events: none;
+}
+
+.coordinate-rank {
+  top: 6px;
+  left: 7px;
+}
+
+.coordinate-file {
+  right: 7px;
+  bottom: 6px;
+}
+
+.control-panel,
+.info-panel {
+  min-width: 0;
+  min-height: 0;
+  max-height: calc(100dvh - (var(--app-padding) * 2));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.control-panel {
+  justify-self: end;
+}
+
+.info-panel {
+  justify-self: start;
+}
+
+.app-header {
+  display: grid;
+  gap: 4px;
+}
+
+.eyebrow,
+.control-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: clamp(2rem, 4vw, 3rem);
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.control-group,
+.status-panel,
+.history-panel {
+  display: grid;
+  gap: 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.history-panel {
+  min-height: 0;
+  flex: 1;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.segmented-control {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgb(255 250 240 / 68%);
+}
+
+.segmented-control-three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.clock-preset-control {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgb(255 250 240 / 68%);
+}
+
+.segmented-button,
+.primary-button,
+.ghost-button,
+.promotion-button {
+  min-height: 42px;
+  border-radius: 6px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.segmented-button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.segmented-button.is-active {
+  background: var(--button);
+  color: var(--button-text);
+}
+
+.clock-settings .segmented-button {
+  min-height: 36px;
+  padding-inline: 4px;
+  font-size: 0.82rem;
+}
+
+.ai-settings {
+  gap: 12px;
+}
+
+.range-control,
+.toggle-control {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink);
+  font-size: 0.92rem;
+  font-weight: 800;
+}
+
+.range-control span,
+.toggle-control {
+  align-items: center;
+}
+
+.range-control span {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.range-control strong {
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.range-control input[type='range'] {
+  width: 100%;
+  accent-color: var(--button);
+}
+
+.toggle-control {
+  grid-template-columns: auto minmax(0, 1fr);
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgb(255 250 240 / 74%);
+}
+
+.toggle-control input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--button);
+}
+
+.action-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.primary-button,
+.ghost-button {
+  border: 1px solid var(--button);
+}
+
+.primary-button {
+  background: var(--button);
+  color: var(--button-text);
+}
+
+.ghost-button {
+  background: transparent;
+  color: var(--button);
+}
+
+.primary-button:disabled,
+.ghost-button:disabled,
+.segmented-button:disabled {
+  opacity: 0.46;
+}
+
+.game-status {
+  min-height: 1.4em;
+  color: var(--accent);
+  font-size: 1.35rem;
+  line-height: 1.2;
+}
+
+.clock-display {
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.clock-card {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  place-content: center;
+  gap: 4px;
+  padding: 12px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgb(255 250 240 / 74%);
+  text-align: center;
+}
+
+.clock-card.is-active {
+  border-color: var(--button);
+  background: #ffffff;
+  box-shadow: inset 0 0 0 2px rgb(38 58 60 / 18%);
+}
+
+.clock-card.is-warning .clock-time {
+  color: #a05a00;
+}
+
+.clock-card.is-danger .clock-time,
+.clock-card.is-timeout .clock-time {
+  color: var(--capture);
+}
+
+.clock-side {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.clock-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  font-size: clamp(1.15rem, 1.8vw, 1.55rem);
+  line-height: 1;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  margin: 0;
+}
+
+.status-grid div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgb(255 250 240 / 74%);
+}
+
+.status-grid dt,
+.status-grid dd {
+  margin: 0;
+}
+
+.status-grid dt {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.status-grid dd {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  font-size: 0.92rem;
+  font-weight: 800;
+}
+
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.move-list {
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgb(255 250 240 / 74%);
+}
+
+.move-row {
+  display: grid;
+  grid-template-columns: 3rem minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgb(201 192 177 / 62%);
+  font-weight: 800;
+}
+
+.move-row:last-child {
+  border-bottom: 0;
+}
+
+.move-number {
+  color: var(--muted);
+}
+
+.move-san {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.move-empty {
+  margin: 0;
+  padding: 14px 12px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.promotion-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(21 25 28 / 58%);
+}
+
+.promotion-overlay[hidden] {
+  display: none;
+}
+
+.promotion-dialog {
+  width: min(92vw, 360px);
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.promotion-dialog h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.promotion-choices {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.promotion-button {
+  min-height: 70px;
+  border: 1px solid var(--button);
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 2.4rem;
+  line-height: 1;
+}
+
+@media (max-width: 1180px) {
+  .chess-app {
+    --board-max-size: min(62dvh, 560px);
+
+    grid-template-columns:
+      minmax(190px, 230px)
+      minmax(300px, var(--board-max-size))
+      minmax(94px, 118px)
+      minmax(220px, 280px);
+    gap: 10px;
+  }
+
+  .segmented-button,
+  .primary-button,
+  .ghost-button,
+  .promotion-button {
+    min-height: 38px;
+  }
+
+  .app-header h1 {
+    font-size: clamp(1.7rem, 3vw, 2.4rem);
+  }
+}
+
+@media (max-width: 960px) {
+  .chess-app {
+    --board-max-size: min(100%, 640px);
+
+    min-height: 100dvh;
+    height: auto;
+    grid-template-columns: minmax(0, 1fr);
+    overflow: visible;
+  }
+
+  .board-stage,
+  .control-panel,
+  .clock-panel,
+  .info-panel {
+    width: min(100%, 640px);
+    justify-self: center;
+  }
+
+  .control-panel,
+  .clock-panel,
+  .info-panel {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .board-stage {
+    order: 2;
+  }
+
+  .control-panel {
+    order: 1;
+  }
+
+  .clock-panel {
+    order: 3;
+    height: auto;
+  }
+
+  .info-panel {
+    order: 4;
+  }
+
+  .clock-display {
+    grid-template-rows: repeat(2, minmax(82px, auto));
+  }
+
+  .status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .move-list {
+    max-height: min(38vh, 360px);
+  }
+}
+
+@media (max-width: 520px) {
+  .chess-app {
+    padding: 12px;
+    gap: 14px;
+  }
+
+  .app-header h1 {
+    font-size: 2rem;
+  }
+
+  .piece {
+    font-size: clamp(1.7rem, 10vw, 3.2rem);
+  }
+
+  .coordinate {
+    font-size: 0.56rem;
+  }
+
+  .action-row {
+    grid-template-columns: 1fr;
+  }
+}
