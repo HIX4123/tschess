@@ -13,11 +13,7 @@ export default defineConfig([
   globalIgnores(['dist']),
   {
     files: ['**/*.ts'],
-    extends: [
-      js.configs.recommended,
-      tseslint.configs.recommendedTypeChecked,
-      prettier,
-    ],
+    extends: [js.configs.recommended, tseslint.configs.recommendedTypeChecked, prettier],
     languageOptions: {
       ecmaVersion: 2020,
       globals: globals.browser,
@@ -30,7 +26,7 @@ export default defineConfig([
       import: importPlugin,
     },
     rules: {
-      'import/no-unresolved': 'error',
+      'import/no-unresolved': ['error', { ignore: ['\\?worker&inline$'] }],
       'import/named': 'error',
       'import/default': 'error',
 

@@ -2,12 +2,14 @@ import {
   AI_PRESETS,
   DEFAULT_AI_SETTINGS,
   normalizeAiSettings,
+  type AiCandidateDebug,
   type AiMoveCommand,
   type AiPreset,
   type AiResponse,
   type AiSettings,
   type AiWorkerMessage,
 } from './ai.ts';
+import AiWorker from './ai.worker.ts?worker&inline';
 import {
   Chess,
   SQUARES,
@@ -40,6 +42,8 @@ const PROMOTION_PIECES: PromotionPiece[] = ['q', 'r', 'b', 'n'];
 const AI_DELAY_MS = 180;
 const CLOCK_TICK_MS = 100;
 const DEFAULT_CLOCK_PRESET: ClockPreset = '10/5';
+const DEBUG_MATE_SCORE_THRESHOLD = 900_000;
+const TEXT_SEPARATOR = ' \u00B7 ';
 const SQUARE_SET = new Set<string>(SQUARES);
 const CLOCK_PRESETS: Record<ClockPreset, ClockConfig> = {
   '1/1': { baseMs: 60_000, incrementMs: 1_000 },
@@ -51,153 +55,25 @@ const CLOCK_PRESETS: Record<ClockPreset, ClockConfig> = {
 
 const PIECE_GLYPHS: Record<Color, Record<PieceSymbol, string>> = {
   w: {
-    p: '♙',
-    n: '♘',
-    b: '♗',
-    r: '♖',
-    q: '♕',
-    k: '♔',
+    p: '\u2659',
+    n: '\u2658',
+    b: '\u2657',
+    r: '\u2656',
+    q: '\u2655',
+    k: '\u2654',
   },
   b: {
-    p: '♟',
-    n: '♞',
-    b: '♝',
-    r: '♜',
-    q: '♛',
-    k: '♚',
+    p: '\u265F',
+    n: '\u265E',
+    b: '\u265D',
+    r: '\u265C',
+    q: '\u265B',
+    k: '\u265A',
   },
 };
 
 export function createChessApp(): void {
-  const root = document.createElement('main');
-  root.className = 'chess-app';
-  root.innerHTML = `
-    <aside class="control-panel" aria-label="게임 컨트롤">
-      <header class="app-header">
-        <p class="eyebrow">Airgap Chess</p>
-        <h1>TS Chess</h1>
-      </header>
-
-      <section class="control-group" aria-label="모드">
-        <span class="control-label">모드</span>
-        <div class="segmented-control" role="group" aria-label="플레이 모드">
-          <button class="segmented-button" type="button" data-mode="local">로컬 2인</button>
-          <button class="segmented-button" type="button" data-mode="ai">AI 상대</button>
-        </div>
-      </section>
-
-      <section id="color-controls" class="control-group" aria-label="진영">
-        <span class="control-label">진영</span>
-        <div class="segmented-control" role="group" aria-label="인간 진영">
-          <button class="segmented-button" type="button" data-color="w">백</button>
-          <button class="segmented-button" type="button" data-color="b">흑</button>
-        </div>
-      </section>
-
-      <section id="ai-controls" class="control-group ai-settings" aria-label="AI 설정">
-        <span class="control-label">AI 설정</span>
-        <div class="segmented-control segmented-control-three" role="group" aria-label="AI 프리셋">
-          <button class="segmented-button" type="button" data-preset="fast">빠름</button>
-          <button class="segmented-button" type="button" data-preset="balanced">균형</button>
-          <button class="segmented-button" type="button" data-preset="strong">최강</button>
-        </div>
-        <label class="range-control">
-          <span>최대 깊이 <strong id="ai-depth-value"></strong></span>
-          <input id="ai-depth-input" type="range" min="1" max="5" step="1" />
-        </label>
-        <label class="range-control">
-          <span>시간 제한 <strong id="ai-time-value"></strong></span>
-          <input id="ai-time-input" type="range" min="500" max="5000" step="250" />
-        </label>
-        <label class="range-control">
-          <span>수 다양성 <strong id="ai-randomness-value"></strong></span>
-          <input
-            id="ai-randomness-input"
-            type="range"
-            min="0"
-            max="30"
-            step="1"
-            aria-label="최선 후보 근처에서 다양한 수를 고르는 정도"
-            title="최선 후보 근처에서 다양한 수를 고르는 정도"
-          />
-        </label>
-        <label class="toggle-control">
-          <input id="ai-quiescence-input" type="checkbox" />
-          <span>전술 탐색</span>
-        </label>
-      </section>
-
-      <section class="control-group clock-settings" aria-label="시간 설정">
-        <span class="control-label">시간</span>
-        <div class="clock-preset-control" role="group" aria-label="시간 프리셋">
-          <button class="segmented-button" type="button" data-clock-preset="1/1">1/1</button>
-          <button class="segmented-button" type="button" data-clock-preset="3/2">3/2</button>
-          <button class="segmented-button" type="button" data-clock-preset="5/3">5/3</button>
-          <button class="segmented-button" type="button" data-clock-preset="10/5">10/5</button>
-          <button class="segmented-button" type="button" data-clock-preset="15/10">15/10</button>
-        </div>
-      </section>
-
-      <section class="action-row" aria-label="게임 동작">
-        <button id="new-game-button" class="primary-button" type="button">새 게임</button>
-        <button id="undo-button" class="ghost-button" type="button">되돌리기</button>
-      </section>
-    </aside>
-
-    <section class="board-stage" aria-label="체스판">
-      <div id="chess-board" class="chess-board" role="grid" aria-label="체스판"></div>
-    </section>
-
-    <aside class="clock-panel" aria-label="체스 타이머">
-      <div id="clock-display" class="clock-display">
-        <div id="white-clock" class="clock-card">
-          <span class="clock-side">백</span>
-          <strong id="white-clock-time" class="clock-time"></strong>
-        </div>
-        <div id="black-clock" class="clock-card">
-          <span class="clock-side">흑</span>
-          <strong id="black-clock-time" class="clock-time"></strong>
-        </div>
-      </div>
-    </aside>
-
-    <aside class="info-panel" aria-label="게임 정보">
-      <section class="status-panel" aria-live="polite">
-        <span class="control-label">상태</span>
-        <strong id="game-status" class="game-status"></strong>
-        <dl class="status-grid">
-          <div>
-            <dt>차례</dt>
-            <dd id="turn-meta"></dd>
-          </div>
-          <div>
-            <dt>모드</dt>
-            <dd id="mode-meta"></dd>
-          </div>
-          <div>
-            <dt>수순</dt>
-            <dd id="move-meta"></dd>
-          </div>
-        </dl>
-      </section>
-
-      <section class="history-panel" aria-label="기보">
-        <div class="history-header">
-          <span class="control-label">기보</span>
-        </div>
-        <div id="move-list" class="move-list"></div>
-      </section>
-    </aside>
-
-    <div id="promotion-overlay" class="promotion-overlay" hidden>
-      <div class="promotion-dialog" role="dialog" aria-modal="true" aria-labelledby="promotion-title">
-        <h2 id="promotion-title">승격</h2>
-        <div id="promotion-choices" class="promotion-choices" role="group" aria-label="승격 기물"></div>
-      </div>
-    </div>
-  `;
-
-  document.body.replaceChildren(root);
+  const root = requireElement<HTMLElement>('#chess-app', document);
 
   const boardElement = requireElement<HTMLDivElement>('#chess-board', root);
   const colorControlsElement = requireElement<HTMLElement>('#color-controls', root);
@@ -206,47 +82,32 @@ export function createChessApp(): void {
   const turnMetaElement = requireElement<HTMLElement>('#turn-meta', root);
   const modeMetaElement = requireElement<HTMLElement>('#mode-meta', root);
   const moveMetaElement = requireElement<HTMLElement>('#move-meta', root);
+  const aiCandidatePanelElement = requireElement<HTMLElement>('#ai-candidate-panel', root);
+  const aiCandidateMetaElement = requireElement<HTMLElement>('#ai-candidate-meta', root);
+  const aiInfoStatusElement = requireElement<HTMLElement>('#ai-info-status', root);
+  const aiInfoPresetElement = requireElement<HTMLElement>('#ai-info-preset', root);
+  const aiInfoHumanElement = requireElement<HTMLElement>('#ai-info-human', root);
+  const aiInfoDepthElement = requireElement<HTMLElement>('#ai-info-depth', root);
+  const aiInfoNodesElement = requireElement<HTMLElement>('#ai-info-nodes', root);
+  const aiInfoScoreElement = requireElement<HTMLElement>('#ai-info-score', root);
+  const aiCandidateListElement = requireElement<HTMLDivElement>('#ai-candidate-list', root);
   const moveListElement = requireElement<HTMLDivElement>('#move-list', root);
   const clockDisplayElement = requireElement<HTMLElement>('#clock-display', root);
   const whiteClockElement = requireElement<HTMLElement>('#white-clock', root);
   const blackClockElement = requireElement<HTMLElement>('#black-clock', root);
-  const whiteClockTimeElement = requireElement<HTMLElement>(
-    '#white-clock-time',
-    root,
-  );
-  const blackClockTimeElement = requireElement<HTMLElement>(
-    '#black-clock-time',
-    root,
-  );
+  const whiteClockTimeElement = requireElement<HTMLElement>('#white-clock-time', root);
+  const blackClockTimeElement = requireElement<HTMLElement>('#black-clock-time', root);
   const newGameButton = requireElement<HTMLButtonElement>('#new-game-button', root);
   const undoButton = requireElement<HTMLButtonElement>('#undo-button', root);
   const aiDepthInput = requireElement<HTMLInputElement>('#ai-depth-input', root);
   const aiDepthValue = requireElement<HTMLElement>('#ai-depth-value', root);
   const aiTimeInput = requireElement<HTMLInputElement>('#ai-time-input', root);
   const aiTimeValue = requireElement<HTMLElement>('#ai-time-value', root);
-  const aiRandomnessInput = requireElement<HTMLInputElement>(
-    '#ai-randomness-input',
-    root,
-  );
-  const aiRandomnessValue = requireElement<HTMLElement>(
-    '#ai-randomness-value',
-    root,
-  );
-  const aiQuiescenceInput = requireElement<HTMLInputElement>(
-    '#ai-quiescence-input',
-    root,
-  );
   const promotionOverlay = requireElement<HTMLDivElement>('#promotion-overlay', root);
   const promotionChoices = requireElement<HTMLDivElement>('#promotion-choices', root);
-  const modeButtons = Array.from(
-    root.querySelectorAll<HTMLButtonElement>('[data-mode]'),
-  );
-  const colorButtons = Array.from(
-    root.querySelectorAll<HTMLButtonElement>('[data-color]'),
-  );
-  const presetButtons = Array.from(
-    root.querySelectorAll<HTMLButtonElement>('[data-preset]'),
-  );
+  const modeButtons = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-mode]'));
+  const colorButtons = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-color]'));
+  const presetButtons = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-preset]'));
   const clockPresetButtons = Array.from(
     root.querySelectorAll<HTMLButtonElement>('[data-clock-preset]'),
   );
@@ -339,20 +200,6 @@ export function createChessApp(): void {
     });
   });
 
-  aiRandomnessInput.addEventListener('input', () => {
-    updateAiSettings({
-      ...aiSettings,
-      randomness: aiRandomnessInput.valueAsNumber,
-    });
-  });
-
-  aiQuiescenceInput.addEventListener('change', () => {
-    updateAiSettings({
-      ...aiSettings,
-      quiescence: aiQuiescenceInput.checked,
-    });
-  });
-
   newGameButton.addEventListener('click', resetGame);
   undoButton.addEventListener('click', undoLastTurn);
 
@@ -439,9 +286,7 @@ export function createChessApp(): void {
       return;
     }
 
-    const matchingMove = pendingPromotion.moves.find(
-      (move) => move.promotion === promotion,
-    );
+    const matchingMove = pendingPromotion.moves.find((move) => move.promotion === promotion);
 
     if (!matchingMove) {
       return;
@@ -538,9 +383,7 @@ export function createChessApp(): void {
     aiRequestId = requestId;
     activeAiRequestId = requestId;
     activeAiFen = fen;
-    aiWorker = new Worker(new URL('./ai.worker.ts', import.meta.url), {
-      type: 'module',
-    });
+    aiWorker = new AiWorker();
 
     aiWorker.addEventListener('message', (event: MessageEvent<AiWorkerMessage>) => {
       handleAiMessage(event.data);
@@ -558,16 +401,12 @@ export function createChessApp(): void {
     aiWorker.postMessage({
       id: requestId,
       fen,
-      settings: aiSettings,
+      settings: resolveAiSettingsForSearch(),
     });
   }
 
   function handleAiMessage(message: AiWorkerMessage): void {
-    if (
-      message.id !== activeAiRequestId ||
-      activeAiFen === null ||
-      game.fen() !== activeAiFen
-    ) {
+    if (message.id !== activeAiRequestId || activeAiFen === null || game.fen() !== activeAiFen) {
       return;
     }
 
@@ -575,6 +414,7 @@ export function createChessApp(): void {
 
     if (message.kind === 'progress') {
       renderStatus();
+      renderAiCandidateDebug();
       return;
     }
 
@@ -622,6 +462,32 @@ export function createChessApp(): void {
     scheduleAiIfNeeded();
   }
 
+  function resolveAiSettingsForSearch(): AiSettings {
+    const settings = normalizeAiSettings(aiSettings);
+
+    if (settings.preset !== 'hard') {
+      return settings;
+    }
+
+    const aiColor = game.turn();
+    const remainingMs = clockMs[aiColor];
+    const incrementMs = CLOCK_PRESETS[clockPreset].incrementMs;
+    const targetMs = remainingMs / 30 + incrementMs * 0.8;
+    const remainingSearchBudgetMs = Math.max(500, remainingMs - 250);
+    const softTimeLimitMs = Math.min(Math.max(targetMs, 800), 6_000, remainingSearchBudgetMs);
+    const timeLimitMs = Math.min(
+      Math.max(softTimeLimitMs * 1.8, 1_200),
+      10_000,
+      remainingSearchBudgetMs,
+    );
+
+    return normalizeAiSettings({
+      ...settings,
+      softTimeLimitMs,
+      timeLimitMs,
+    });
+  }
+
   function resetClockState(): void {
     clockMs = createClockState(clockPreset);
     timedOutColor = null;
@@ -658,11 +524,7 @@ export function createChessApp(): void {
   }
 
   function flushClockElapsed(): boolean {
-    if (
-      activeClockColor === null ||
-      timedOutColor !== null ||
-      game.isGameOver()
-    ) {
+    if (activeClockColor === null || timedOutColor !== null || game.isGameOver()) {
       return true;
     }
 
@@ -674,10 +536,7 @@ export function createChessApp(): void {
       return true;
     }
 
-    clockMs[activeClockColor] = Math.max(
-      0,
-      clockMs[activeClockColor] - elapsedMs,
-    );
+    clockMs[activeClockColor] = Math.max(0, clockMs[activeClockColor] - elapsedMs);
 
     if (clockMs[activeClockColor] === 0) {
       handleClockTimeout(activeClockColor);
@@ -707,6 +566,7 @@ export function createChessApp(): void {
     renderClocks();
     renderBoard();
     renderStatus();
+    renderAiCandidateDebug();
     renderMoveList();
     renderPromotionDialog();
   }
@@ -741,10 +601,9 @@ export function createChessApp(): void {
     aiDepthInput.value = String(aiSettings.maxDepth);
     aiDepthValue.textContent = `${aiSettings.maxDepth}`;
     aiTimeInput.value = String(aiSettings.timeLimitMs);
-    aiTimeValue.textContent = `${formatSeconds(aiSettings.timeLimitMs)}`;
-    aiRandomnessInput.value = String(aiSettings.randomness);
-    aiRandomnessValue.textContent = `${aiSettings.randomness}/30`;
-    aiQuiescenceInput.checked = aiSettings.quiescence;
+    aiTimeInput.disabled = aiSettings.preset === 'hard';
+    aiTimeValue.textContent =
+      aiSettings.preset === 'hard' ? '자동' : `${formatSeconds(aiSettings.timeLimitMs)}`;
   }
 
   function renderClockSettingsControls(): void {
@@ -758,10 +617,8 @@ export function createChessApp(): void {
   function renderClocks(): void {
     const bottomColor = getBoardOrientation();
     const topColor = oppositeColor(bottomColor);
-    const topClockElement =
-      topColor === 'w' ? whiteClockElement : blackClockElement;
-    const bottomClockElement =
-      bottomColor === 'w' ? whiteClockElement : blackClockElement;
+    const topClockElement = topColor === 'w' ? whiteClockElement : blackClockElement;
+    const bottomClockElement = bottomColor === 'w' ? whiteClockElement : blackClockElement;
 
     if (
       clockDisplayElement.children[0] !== topClockElement ||
@@ -784,11 +641,7 @@ export function createChessApp(): void {
     clockElement.classList.toggle('is-top', !isBottom);
   }
 
-  function renderClock(
-    color: Color,
-    clockElement: HTMLElement,
-    timeElement: HTMLElement,
-  ): void {
+  function renderClock(color: Color, clockElement: HTMLElement, timeElement: HTMLElement): void {
     const remainingMs = clockMs[color];
     const isActive = activeClockColor === color && timedOutColor === null;
     const isTimedOut = timedOutColor === color;
@@ -851,8 +704,118 @@ export function createChessApp(): void {
     modeMetaElement.textContent =
       mode === 'local'
         ? '로컬 2인'
-        : `AI 상대 · 인간 ${colorName(humanColor)} · ${presetName(aiSettings.preset)}`;
-    moveMetaElement.textContent = `${game.moveNumber()}수 · ${historyLength} half-move`;
+        : ['AI 상대', `인간 ${colorName(humanColor)}`, presetName(aiSettings.preset)].join(
+            TEXT_SEPARATOR,
+          );
+    moveMetaElement.textContent = [`${game.moveNumber()}수`, `${historyLength} half-move`].join(
+      TEXT_SEPARATOR,
+    );
+  }
+
+  function renderAiCandidateDebug(): void {
+    if (mode !== 'ai') {
+      aiCandidatePanelElement.hidden = true;
+      aiCandidateMetaElement.textContent = '';
+      aiInfoStatusElement.textContent = '';
+      aiInfoPresetElement.textContent = '';
+      aiInfoHumanElement.textContent = '';
+      aiInfoDepthElement.textContent = '';
+      aiInfoNodesElement.textContent = '';
+      aiInfoScoreElement.textContent = '';
+      aiCandidateListElement.replaceChildren();
+      return;
+    }
+
+    const debug = aiProgress?.debug;
+    aiCandidatePanelElement.hidden = false;
+    aiCandidateMetaElement.textContent = aiProgress
+      ? `경과 ${formatSeconds(aiProgress.elapsedMs)}`
+      : '';
+    aiInfoStatusElement.textContent = getAiInfoStatusText();
+    aiInfoPresetElement.textContent = presetName(aiSettings.preset);
+    aiInfoHumanElement.textContent = colorName(humanColor);
+    aiInfoDepthElement.textContent = aiProgress ? String(aiProgress.depthReached) : '-';
+    aiInfoNodesElement.textContent = aiProgress ? `${formatNodes(aiProgress.nodes)} nodes` : '-';
+    aiInfoScoreElement.textContent = aiProgress ? formatDebugScore(aiProgress.score) : '-';
+
+    if (!debug || debug.candidates.length === 0) {
+      aiCandidateListElement.replaceChildren();
+      return;
+    }
+
+    aiCandidateMetaElement.textContent = [
+      aiCandidateMetaElement.textContent,
+      `best ${formatDebugScore(debug.bestScore)}`,
+      `창 ${Math.round(debug.windowCp)}`,
+      `p ${debug.ticketPower.toFixed(2)}`,
+    ].join(TEXT_SEPARATOR);
+
+    const fragment = document.createDocumentFragment();
+
+    for (const candidate of debug.candidates) {
+      fragment.appendChild(createAiCandidateRow(candidate));
+    }
+
+    aiCandidateListElement.replaceChildren(fragment);
+  }
+
+  function getAiInfoStatusText(): string {
+    if (game.isGameOver() || timedOutColor !== null) {
+      return '대국 종료';
+    }
+
+    if (aiThinking) {
+      return aiProgress ? '계산 중' : '계산 준비 중';
+    }
+
+    return game.turn() === humanColor ? '대기 중' : '응수 대기';
+  }
+
+  function createAiCandidateRow(candidate: AiCandidateDebug): HTMLDivElement {
+    const row = document.createElement('div');
+    row.className = 'ai-candidate-row';
+    row.classList.toggle('is-selected', candidate.selected);
+    row.classList.toggle('is-principal', candidate.principal);
+    row.setAttribute('role', 'row');
+
+    const sanCell = createAiCandidateCell('ai-candidate-san', candidate.san);
+
+    if (candidate.selected) {
+      sanCell.appendChild(createAiCandidateBadge('SEL'));
+    }
+
+    if (candidate.principal) {
+      sanCell.appendChild(createAiCandidateBadge('PV'));
+    }
+
+    row.append(
+      sanCell,
+      createAiCandidateCell('ai-candidate-score', formatDebugScore(candidate.score)),
+      createAiCandidateCell('ai-candidate-weight', formatDebugWeight(candidate.tickets)),
+      createAiCandidateCell(
+        'ai-candidate-probability',
+        formatDebugProbability(candidate.probability),
+      ),
+    );
+
+    return row;
+  }
+
+  function createAiCandidateCell(className: string, text: string): HTMLSpanElement {
+    const cell = document.createElement('span');
+    cell.className = className;
+    cell.setAttribute('role', 'cell');
+    cell.textContent = text;
+
+    return cell;
+  }
+
+  function createAiCandidateBadge(text: string): HTMLSpanElement {
+    const badge = document.createElement('span');
+    badge.className = 'ai-candidate-badge';
+    badge.textContent = text;
+
+    return badge;
   }
 
   function renderMoveList(): void {
@@ -912,10 +875,7 @@ export function createChessApp(): void {
 
   function getSquareClasses(square: Square, lastMove: Move | null): string {
     const squareColor = game.squareColor(square);
-    const classes = [
-      'board-square',
-      squareColor === 'light' ? 'is-light' : 'is-dark',
-    ];
+    const classes = ['board-square', squareColor === 'light' ? 'is-light' : 'is-dark'];
     const destinationMove = legalMoves.find((move) => move.to === square);
 
     if (selectedSquare === square) {
@@ -963,15 +923,14 @@ export function createChessApp(): void {
     }
 
     if (timedOutColor) {
-      return `${colorName(timedOutColor)} 시간 초과 · ${colorName(oppositeColor(timedOutColor))} 승리`;
+      return [
+        `${colorName(timedOutColor)} 시간 초과`,
+        `${colorName(oppositeColor(timedOutColor))} 승리`,
+      ].join(TEXT_SEPARATOR);
     }
 
     if (aiThinking) {
-      if (!aiProgress) {
-        return 'AI 계산 준비 중';
-      }
-
-      return `AI 계산 중 · depth ${aiProgress.depthReached} · ${formatNodes(aiProgress.nodes)} nodes`;
+      return 'AI 계산 중';
     }
 
     if (game.isCheck()) {
@@ -1000,9 +959,7 @@ export function createChessApp(): void {
   function isCheckedKing(square: Square): boolean {
     const piece = game.get(square);
 
-    return Boolean(
-      piece && piece.type === 'k' && piece.color === game.turn() && game.isCheck(),
-    );
+    return Boolean(piece && piece.type === 'k' && piece.color === game.turn() && game.isCheck());
   }
 }
 
@@ -1058,16 +1015,12 @@ function isPromotionPiece(value: string | undefined): value is PromotionPiece {
 }
 
 function isAiPreset(value: string | undefined): value is AiPreset {
-  return value === 'fast' || value === 'balanced' || value === 'strong';
+  return value === 'easy' || value === 'normal' || value === 'hard';
 }
 
 function isClockPreset(value: string | undefined): value is ClockPreset {
   return (
-    value === '1/1' ||
-    value === '3/2' ||
-    value === '5/3' ||
-    value === '10/5' ||
-    value === '15/10'
+    value === '1/1' || value === '3/2' || value === '5/3' || value === '10/5' || value === '15/10'
   );
 }
 
@@ -1087,12 +1040,12 @@ function colorName(color: Color): string {
 
 function presetName(preset: AiPreset): string {
   switch (preset) {
-    case 'fast':
-      return '빠름';
-    case 'balanced':
-      return '균형';
-    case 'strong':
-      return '최강';
+    case 'easy':
+      return '쉬움';
+    case 'normal':
+      return '보통';
+    case 'hard':
+      return '어려움';
   }
 }
 
@@ -1126,6 +1079,40 @@ function formatNodes(nodes: number): string {
   }
 
   return String(nodes);
+}
+
+function formatDebugScore(score: number): string {
+  if (Math.abs(score) >= DEBUG_MATE_SCORE_THRESHOLD) {
+    return score > 0 ? '+mate-ish' : '-mate-ish';
+  }
+
+  return score > 0 ? `+${Math.round(score)}` : String(Math.round(score));
+}
+
+function formatDebugWeight(weight: number): string {
+  if (weight === 0) {
+    return '0';
+  }
+
+  if (weight < 0.001) {
+    return '<0.001';
+  }
+
+  return weight.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function formatDebugProbability(probability: number): string {
+  const percent = probability * 100;
+
+  if (percent === 0) {
+    return '0%';
+  }
+
+  if (percent < 0.1) {
+    return '<0.1%';
+  }
+
+  return `${percent.toFixed(1)}%`;
 }
 
 function oppositeColor(color: Color): Color {

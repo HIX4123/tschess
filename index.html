@@ -6,6 +6,166 @@
     <title>TS Chess</title>
   </head>
   <body>
+    <main id="chess-app" class="chess-app">
+      <aside class="control-panel" aria-label="게임 컨트롤">
+        <section class="control-group" aria-label="모드">
+          <span class="control-label">모드</span>
+          <div class="segmented-control" role="group" aria-label="플레이 모드">
+            <button class="segmented-button" type="button" data-mode="local">로컬 2인</button>
+            <button class="segmented-button" type="button" data-mode="ai">AI 상대</button>
+          </div>
+        </section>
+
+        <section id="color-controls" class="control-group" aria-label="진영">
+          <span class="control-label">진영</span>
+          <div class="segmented-control" role="group" aria-label="인간 진영">
+            <button class="segmented-button" type="button" data-color="w">백</button>
+            <button class="segmented-button" type="button" data-color="b">흑</button>
+          </div>
+        </section>
+
+        <section id="ai-controls" class="control-group ai-settings" aria-label="AI 설정">
+          <span class="control-label">AI 설정</span>
+          <div
+            class="segmented-control segmented-control-three"
+            role="group"
+            aria-label="AI 프리셋"
+          >
+            <button class="segmented-button" type="button" data-preset="easy">쉬움</button>
+            <button class="segmented-button" type="button" data-preset="normal">보통</button>
+            <button class="segmented-button" type="button" data-preset="hard">어려움</button>
+          </div>
+          <label class="range-control">
+            <span>최대 깊이 <strong id="ai-depth-value"></strong></span>
+            <input id="ai-depth-input" type="range" min="1" max="5" step="1" />
+          </label>
+          <label class="range-control">
+            <span>시간 제한 <strong id="ai-time-value"></strong></span>
+            <input id="ai-time-input" type="range" min="500" max="5000" step="250" />
+          </label>
+        </section>
+
+        <section class="control-group clock-settings" aria-label="시간 설정">
+          <span class="control-label">시간</span>
+          <div class="clock-preset-control" role="group" aria-label="시간 프리셋">
+            <button class="segmented-button" type="button" data-clock-preset="1/1">1/1</button>
+            <button class="segmented-button" type="button" data-clock-preset="3/2">3/2</button>
+            <button class="segmented-button" type="button" data-clock-preset="5/3">5/3</button>
+            <button class="segmented-button" type="button" data-clock-preset="10/5">10/5</button>
+            <button class="segmented-button" type="button" data-clock-preset="15/10">15/10</button>
+          </div>
+        </section>
+
+        <section class="action-row" aria-label="게임 동작">
+          <button id="new-game-button" class="primary-button" type="button">새 게임</button>
+          <button id="undo-button" class="ghost-button" type="button">되돌리기</button>
+        </section>
+      </aside>
+
+      <section class="board-stage" aria-label="체스판">
+        <div id="chess-board" class="chess-board" role="grid" aria-label="체스판"></div>
+      </section>
+
+      <aside class="clock-panel" aria-label="체스 타이머">
+        <div id="clock-display" class="clock-display">
+          <div id="white-clock" class="clock-card">
+            <span class="clock-side">백</span>
+            <strong id="white-clock-time" class="clock-time"></strong>
+          </div>
+          <div id="black-clock" class="clock-card">
+            <span class="clock-side">흑</span>
+            <strong id="black-clock-time" class="clock-time"></strong>
+          </div>
+        </div>
+      </aside>
+
+      <aside class="info-panel" aria-label="게임 정보">
+        <section class="status-panel" aria-live="polite">
+          <span class="control-label">상태</span>
+          <strong id="game-status" class="game-status"></strong>
+          <dl class="status-grid">
+            <div>
+              <dt>차례</dt>
+              <dd id="turn-meta"></dd>
+            </div>
+            <div>
+              <dt>모드</dt>
+              <dd id="mode-meta"></dd>
+            </div>
+            <div>
+              <dt>수순</dt>
+              <dd id="move-meta"></dd>
+            </div>
+          </dl>
+        </section>
+
+        <section id="ai-candidate-panel" class="ai-candidate-panel" aria-label="AI 정보" hidden>
+          <div class="ai-candidate-header">
+            <span class="control-label">AI 정보</span>
+            <span id="ai-candidate-meta" class="ai-candidate-meta"></span>
+          </div>
+          <dl class="ai-info-grid">
+            <div>
+              <dt>상태</dt>
+              <dd id="ai-info-status"></dd>
+            </div>
+            <div>
+              <dt>난이도</dt>
+              <dd id="ai-info-preset"></dd>
+            </div>
+            <div>
+              <dt>인간</dt>
+              <dd id="ai-info-human"></dd>
+            </div>
+            <div>
+              <dt>depth</dt>
+              <dd id="ai-info-depth"></dd>
+            </div>
+            <div>
+              <dt>nodes</dt>
+              <dd id="ai-info-nodes"></dd>
+            </div>
+            <div>
+              <dt>score</dt>
+              <dd id="ai-info-score"></dd>
+            </div>
+          </dl>
+          <div class="ai-candidate-table" role="table" aria-label="AI 후보 수 평가">
+            <div class="ai-candidate-row ai-candidate-head" role="row">
+              <span role="columnheader">SAN</span>
+              <span role="columnheader">cp</span>
+              <span role="columnheader">weight</span>
+              <span role="columnheader">prob</span>
+            </div>
+            <div id="ai-candidate-list" class="ai-candidate-list"></div>
+          </div>
+        </section>
+
+        <section class="history-panel" aria-label="기보">
+          <div class="history-header">
+            <span class="control-label">기보</span>
+          </div>
+          <div id="move-list" class="move-list"></div>
+        </section>
+      </aside>
+
+      <div id="promotion-overlay" class="promotion-overlay" hidden>
+        <div
+          class="promotion-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="promotion-title"
+        >
+          <h2 id="promotion-title">승격</h2>
+          <div
+            id="promotion-choices"
+            class="promotion-choices"
+            role="group"
+            aria-label="승격 기물"
+          ></div>
+        </div>
+      </div>
+    </main>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

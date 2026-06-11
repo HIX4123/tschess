@@ -6,7 +6,7 @@ import {
   type Square,
 } from './chess-core.ts';
 
-export type AiPreset = 'fast' | 'balanced' | 'strong';
+export type AiPreset = 'easy' | 'normal' | 'hard';
 export type AiDepth = 1 | 2 | 3 | 4 | 5;  
 export type AiMoveCommand = {
   from: Square;
@@ -17,6 +17,7 @@ export type AiSettings = {
   preset: AiPreset;
   maxDepth: AiDepth;
   timeLimitMs: number;
+  softTimeLimitMs?: number;
   randomness: number;
   quiescence: boolean;
 };
@@ -32,24 +33,60 @@ export type AiResponse = {
   nodes: number;
   elapsedMs: number;
   score: number;
+  debug?: AiDebugInfo;
+};
+export type AiCandidateDebug = {
+  move: AiMoveCommand;
+  san: string;
+  score: number;
+  tickets: number;
+  probability: number;
+  selected: boolean;
+  principal: boolean;
+};
+export type AiDebugInfo = {
+  candidates: AiCandidateDebug[];
+  bestScore: number;
+  windowCp: number;
+  floorScore: number;
+  ticketPower: number;
+  totalTickets: number;
 };
 export type AiProgressMessage = AiResponse & { kind: 'progress' };
 export type AiResultMessage = AiResponse & { kind: 'result' };
 export type AiWorkerMessage = AiProgressMessage | AiResultMessage;
 
 type SearchContext = {
+  requestId: number;
   settings: AiSettings;
   deadline: number;
   startTime: number;
   nodes: number;
+  onProgress?: (message: AiProgressMessage) => void;
+  lastProgressAt: number;
+  progressState: SearchProgressState;
+};
+type SearchProgressState = {
+  move: AiMoveCommand | null;
+  depthReached: number;
+  score: number;
+  debug?: AiDebugInfo;
 };
 type SearchResult = {
   move: AiMoveCommand;
   score: number;
 };
+type RootCandidate = SearchResult & {
+  san: string;
+};
 type RootSearchResult = {
   selected: SearchResult;
   principal: SearchResult;
+  debug: AiDebugInfo;
+};
+type RootSelection = {
+  selected: SearchResult;
+  debug: AiDebugInfo;
 };
 type PawnInfo = {
   color: Color;
@@ -57,30 +94,32 @@ type PawnInfo = {
   rank: number;
 };
 
+const MAX_RANDOMNESS = 30;
+
 export const AI_PRESETS: Record<AiPreset, AiSettings> = {
-  fast: {
-    preset: 'fast',
+  easy: {
+    preset: 'easy',
     maxDepth: 2,
     timeLimitMs: 750,
-    randomness: 20,
+    randomness: MAX_RANDOMNESS,
     quiescence: true,
   },
-  balanced: {
-    preset: 'balanced',
-    maxDepth: 4,
-    timeLimitMs: 2_500,
-    randomness: 8,
-    quiescence: true,
-  },
-  strong: {
-    preset: 'strong',
+  normal: {
+    preset: 'normal',
     maxDepth: 5,
     timeLimitMs: 5_000,
-    randomness: 0,
+    randomness: MAX_RANDOMNESS,
+    quiescence: true,
+  },
+  hard: {
+    preset: 'hard',
+    maxDepth: 5,
+    timeLimitMs: 5_000,
+    randomness: MAX_RANDOMNESS,
     quiescence: true,
   },
 };
-export const DEFAULT_AI_SETTINGS: AiSettings = { ...AI_PRESETS.strong };
+export const DEFAULT_AI_SETTINGS: AiSettings = { ...AI_PRESETS.normal };
 
 const PIECE_VALUES: Record<PieceSymbol, number> = {
   p: 100,
@@ -97,12 +136,17 @@ const MATE_SCORE = 1_000_000;
 const DRAW_SCORE = 0;
 const QUIESCENCE_MAX_PLY = 6;
 const TIME_CHECK_INTERVAL = 2_048;
-const MAX_RANDOMNESS = 30;
+const PROGRESS_HEARTBEAT_MS = 100;
 const RANDOM_WINDOW_BASE_CP = 20;
 const RANDOM_WINDOW_RANGE_CP = 150;
 const RANDOM_TICKET_POWER_MAX = 4;
 const RANDOM_TICKET_POWER_RANGE = 1.5;
 const MATE_RANDOM_PROTECTION_SCORE = MATE_SCORE - 10_000;
+const ADAPTIVE_MIN_DEPTH = 2;
+const ADAPTIVE_CLEAR_GAP_CP = 120;
+const ADAPTIVE_TACTICAL_GAP_CP = 220;
+const ADAPTIVE_SCORE_SWING_CP = 90;
+const ADAPTIVE_TACTICAL_RATIO = 0.35;
 
 export function searchBestMove(
   request: AiRequest,
@@ -113,10 +157,18 @@ export function searchBestMove(
   const legalMoves = chess.moves({ verbose: true });
   const startTime = Date.now();
   const ctx: SearchContext = {
+    requestId: request.id,
     settings,
     deadline: startTime + settings.timeLimitMs,
     startTime,
     nodes: 0,
+    onProgress,
+    lastProgressAt: startTime,
+    progressState: {
+      move: null,
+      depthReached: 0,
+      score: 0,
+    },
   };
 
   if (legalMoves.length === 0) {
@@ -131,24 +183,45 @@ export function searchBestMove(
   }
 
   let best: SearchResult | null = null;
+  let debug: AiDebugInfo | undefined;
   let previousBestMove: AiMoveCommand | null = null;
+  let previousPrincipal: SearchResult | null = null;
   let depthReached = 0;
 
   for (let depth = 1; depth <= settings.maxDepth; depth += 1) {
     try {
       const result = searchRoot(chess, depth, ctx, previousBestMove);
+      const elapsedMs = Date.now() - startTime;
       best = result.selected;
+      debug = result.debug;
       previousBestMove = result.principal.move;
       depthReached = depth;
-      onProgress?.({
-        kind: 'progress',
-        id: request.id,
-        move: best.move,
-        depthReached,
-        nodes: ctx.nodes,
-        elapsedMs: Date.now() - startTime,
-        score: best.score,
-      });
+      publishSearchProgress(
+        ctx,
+        {
+          move: best.move,
+          depthReached,
+          score: best.score,
+          debug,
+        },
+        elapsedMs,
+      );
+
+      if (
+        shouldStopAfterSoftLimit(
+          chess,
+          legalMoves,
+          result,
+          previousPrincipal,
+          depth,
+          elapsedMs,
+          settings,
+        )
+      ) {
+        break;
+      }
+
+      previousPrincipal = result.principal;
     } catch (error) {
       if (error instanceof SearchTimeout) {
         break;
@@ -171,16 +244,27 @@ export function searchBestMove(
     nodes: ctx.nodes,
     elapsedMs: Date.now() - startTime,
     score: best.score,
+    debug,
   };
 }
 
 export function normalizeAiSettings(settings: AiSettings): AiSettings {
+  const timeLimitMs = clamp(Math.round(settings.timeLimitMs), 500, 10_000);
+  const softTimeLimitMs =
+    settings.softTimeLimitMs === undefined
+      ? undefined
+      : Math.min(
+          timeLimitMs,
+          clamp(Math.round(settings.softTimeLimitMs), 500, 10_000),
+        );
+
   return {
     preset: settings.preset,
     maxDepth: clampDepth(settings.maxDepth),
-    timeLimitMs: clamp(Math.round(settings.timeLimitMs), 500, 5_000),
-    randomness: clamp(Math.round(settings.randomness), 0, MAX_RANDOMNESS),
-    quiescence: settings.quiescence,
+    timeLimitMs,
+    ...(softTimeLimitMs === undefined ? {} : { softTimeLimitMs }),
+    randomness: MAX_RANDOMNESS,
+    quiescence: true,
   };
 }
 
@@ -190,20 +274,25 @@ function searchRoot(
   ctx: SearchContext,
   previousBestMove: AiMoveCommand | null,
 ): RootSearchResult {
-  let alpha = -INFINITY_SCORE;
-  const candidates: SearchResult[] = [];
+  const candidates: RootCandidate[] = [];
   const legalMoves = orderMoves(chess.moves({ verbose: true }), previousBestMove);
 
   for (const move of legalMoves) {
     checkTime(ctx);
     chess.move(toMoveCommand(move));
 
-    const score = -negamax(chess, depth - 1, -INFINITY_SCORE, -alpha, 1, ctx);
+    const score = -negamax(
+      chess,
+      depth - 1,
+      -INFINITY_SCORE,
+      INFINITY_SCORE,
+      1,
+      ctx,
+    );
 
     chess.undo();
 
-    candidates.push({ move: toMoveCommand(move), score });
-    alpha = Math.max(alpha, score);
+    candidates.push({ move: toMoveCommand(move), san: move.san, score });
   }
 
   if (candidates.length === 0) {
@@ -211,11 +300,80 @@ function searchRoot(
   }
 
   const principal = selectBestRootMove(candidates);
+  const selection = selectRootMove(candidates, ctx.settings, principal);
 
   return {
-    selected: selectRootMove(candidates, ctx.settings, principal),
+    selected: selection.selected,
     principal,
+    debug: selection.debug,
   };
+}
+
+function shouldStopAfterSoftLimit(
+  chess: Chess,
+  rootMoves: Move[],
+  result: RootSearchResult,
+  previousPrincipal: SearchResult | null,
+  depth: number,
+  elapsedMs: number,
+  settings: AiSettings,
+): boolean {
+  if (
+    settings.preset !== 'hard' ||
+    settings.softTimeLimitMs === undefined ||
+    elapsedMs < settings.softTimeLimitMs ||
+    depth < ADAPTIVE_MIN_DEPTH
+  ) {
+    return false;
+  }
+
+  if (chess.isCheck() || result.principal.score < 0) {
+    return false;
+  }
+
+  if (
+    previousPrincipal === null ||
+    !isSameMoveCommand(previousPrincipal.move, result.principal.move) ||
+    Math.abs(previousPrincipal.score - result.principal.score) >
+      ADAPTIVE_SCORE_SWING_CP
+  ) {
+    return false;
+  }
+
+  const scoreGap = rootScoreGap(result.debug);
+
+  if (scoreGap < ADAPTIVE_CLEAR_GAP_CP) {
+    return false;
+  }
+
+  if (
+    tacticalMoveRatio(rootMoves) >= ADAPTIVE_TACTICAL_RATIO &&
+    scoreGap < ADAPTIVE_TACTICAL_GAP_CP
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function rootScoreGap(debug: AiDebugInfo): number {
+  const [bestCandidate, secondCandidate] = debug.candidates;
+
+  if (!bestCandidate || !secondCandidate) {
+    return INFINITY_SCORE;
+  }
+
+  return bestCandidate.score - secondCandidate.score;
+}
+
+function tacticalMoveRatio(moves: Move[]): number {
+  if (moves.length === 0) {
+    return 0;
+  }
+
+  const tacticalMoveCount = moves.filter(isTacticalMove).length;
+
+  return tacticalMoveCount / moves.length;
 }
 
 function negamax(
@@ -609,9 +767,39 @@ function chooseFallbackMove(chess: Chess): SearchResult {
 function checkTime(ctx: SearchContext): void {
   ctx.nodes += 1;
 
-  if (ctx.nodes % TIME_CHECK_INTERVAL === 0 && Date.now() >= ctx.deadline) {
+  if (ctx.nodes % TIME_CHECK_INTERVAL !== 0) {
+    return;
+  }
+
+  const now = Date.now();
+
+  if (now - ctx.lastProgressAt >= PROGRESS_HEARTBEAT_MS) {
+    publishSearchProgress(ctx, ctx.progressState, now - ctx.startTime, now);
+  }
+
+  if (now >= ctx.deadline) {
     throw new SearchTimeout();
   }
+}
+
+function publishSearchProgress(
+  ctx: SearchContext,
+  progressState: SearchProgressState,
+  elapsedMs = Date.now() - ctx.startTime,
+  progressAt = Date.now(),
+): void {
+  ctx.progressState = progressState;
+  ctx.lastProgressAt = progressAt;
+  ctx.onProgress?.({
+    kind: 'progress',
+    id: ctx.requestId,
+    move: progressState.move,
+    depthReached: progressState.depthReached,
+    nodes: ctx.nodes,
+    elapsedMs,
+    score: progressState.score,
+    debug: progressState.debug,
+  });
 }
 
 function isTacticalMove(move: Move): boolean {
@@ -624,19 +812,30 @@ function isTacticalMove(move: Move): boolean {
 }
 
 function selectRootMove(
-  candidates: SearchResult[],
+  candidates: RootCandidate[],
   settings: AiSettings,
   best: SearchResult,
-): SearchResult {
-  if (settings.randomness === 0 || isMateProtectedScore(best.score)) {
-    return best;
-  }
-
+): RootSelection {
   const level = settings.randomness / MAX_RANDOMNESS;
   const windowCp = RANDOM_WINDOW_BASE_CP + RANDOM_WINDOW_RANGE_CP * level;
   const floorScore = best.score - windowCp;
   const ticketPower =
     RANDOM_TICKET_POWER_MAX - RANDOM_TICKET_POWER_RANGE * level;
+
+  if (shouldForceBestMove(settings, best)) {
+    return {
+      selected: best,
+      debug: createDeterministicDebug(
+        candidates,
+        best,
+        best,
+        windowCp,
+        floorScore,
+        ticketPower,
+      ),
+    };
+  }
+
   const weightedCandidates = candidates
     .map((candidate) => ({
       candidate,
@@ -650,26 +849,126 @@ function selectRootMove(
   );
 
   if (totalTickets <= 0) {
-    return best;
+    return {
+      selected: best,
+      debug: createDeterministicDebug(
+        candidates,
+        best,
+        best,
+        windowCp,
+        floorScore,
+        ticketPower,
+      ),
+    };
   }
 
   let draw = Math.random() * totalTickets;
+  let selected = best;
 
   for (const { candidate, tickets } of weightedCandidates) {
     draw -= tickets;
 
     if (draw <= 0) {
-      return candidate;
+      selected = candidate;
+      break;
     }
   }
 
-  return best;
+  return {
+    selected,
+    debug: createWeightedDebug(
+      candidates,
+      best,
+      selected,
+      weightedCandidates,
+      windowCp,
+      floorScore,
+      ticketPower,
+      totalTickets,
+    ),
+  };
 }
 
-function selectBestRootMove(candidates: SearchResult[]): SearchResult {
+function shouldForceBestMove(
+  settings: AiSettings,
+  best: SearchResult,
+): boolean {
+  return (
+    settings.randomness === 0 ||
+    isMateProtectedScore(best.score) ||
+    (settings.preset === 'hard' && best.score < 0)
+  );
+}
+
+function selectBestRootMove(candidates: RootCandidate[]): SearchResult {
   return candidates.reduce((currentBest, candidate) =>
     candidate.score > currentBest.score ? candidate : currentBest,
   );
+}
+
+function createDeterministicDebug(
+  candidates: RootCandidate[],
+  principal: SearchResult,
+  selected: SearchResult,
+  windowCp: number,
+  floorScore: number,
+  ticketPower: number,
+): AiDebugInfo {
+  return {
+    candidates: sortCandidatesByScore(candidates).map((candidate) => ({
+      move: candidate.move,
+      san: candidate.san,
+      score: candidate.score,
+      tickets: isSameMoveCommand(candidate.move, selected.move) ? 1 : 0,
+      probability: isSameMoveCommand(candidate.move, selected.move) ? 1 : 0,
+      selected: isSameMoveCommand(candidate.move, selected.move),
+      principal: isSameMoveCommand(candidate.move, principal.move),
+    })),
+    bestScore: principal.score,
+    windowCp,
+    floorScore,
+    ticketPower,
+    totalTickets: 1,
+  };
+}
+
+function createWeightedDebug(
+  candidates: RootCandidate[],
+  principal: SearchResult,
+  selected: SearchResult,
+  weightedCandidates: Array<{ candidate: RootCandidate; tickets: number }>,
+  windowCp: number,
+  floorScore: number,
+  ticketPower: number,
+  totalTickets: number,
+): AiDebugInfo {
+  return {
+    candidates: sortCandidatesByScore(candidates).map((candidate) => {
+      const weightedCandidate = weightedCandidates.find(({ candidate: weighted }) =>
+        isSameMoveCommand(weighted.move, candidate.move),
+      );
+      const tickets = weightedCandidate?.tickets ?? 0;
+
+      return {
+        move: candidate.move,
+        san: candidate.san,
+        score: candidate.score,
+        tickets,
+        probability: totalTickets > 0 ? tickets / totalTickets : 0,
+        selected: isSameMoveCommand(candidate.move, selected.move),
+        principal: isSameMoveCommand(candidate.move, principal.move),
+      };
+    }),
+    bestScore: principal.score,
+    windowCp,
+    floorScore,
+    ticketPower,
+    totalTickets,
+  };
+}
+
+function sortCandidatesByScore(candidates: RootCandidate[]): RootCandidate[] {
+  return [...candidates].sort((left, right) => right.score - left.score);
 }
 
 function isMateProtectedScore(score: number): boolean {
@@ -693,6 +992,17 @@ function isSameMove(move: Move, command: AiMoveCommand): boolean {
     move.from === command.from &&
     move.to === command.to &&
     (move.promotion ?? undefined) === (command.promotion ?? undefined)
+  );
+}
+
+function isSameMoveCommand(
+  left: AiMoveCommand,
+  right: AiMoveCommand,
+): boolean {
+  return (
+    left.from === right.from &&
+    left.to === right.to &&
+    (left.promotion ?? undefined) === (right.promotion ?? undefined)
   );
 }
 
