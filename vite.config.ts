@@ -1,8 +1,13 @@
 import path from 'node:path';
 
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 
 import type { MinifyOptions } from 'terser';
+
+const CHESS_SOURCE_DIR = path.resolve(__dirname, 'src/chess');
+const CHESS_RUNTIME_GLOBAL_PATH = path.join(CHESS_SOURCE_DIR, 'chess-runtime.global.ts');
+const MAIN_BUNDLE_FILE = 'main.js';
+const STYLE_BUNDLE_FILE = 'style.css';
 
 /**
  * 운영 배포용 압축 정책입니다.
@@ -23,10 +28,27 @@ const terserOptions: MinifyOptions = {
   },
 };
 
+function createChessRuntimeBuildAliasPlugin(): Plugin {
+  return {
+    name: 'tschess-chess-runtime-build-alias',
+    apply: 'build',
+    enforce: 'pre',
+    resolveId(source) {
+      if (source !== './chess-runtime.ts') {
+        return null;
+      }
+
+      return CHESS_RUNTIME_GLOBAL_PATH;
+    },
+  };
+}
+
 /**
  * Vite 빌드 설정입니다.
  */
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  base: './',
+  plugins: [createChessRuntimeBuildAliasPlugin()],
   build: {
     modulePreload: false,
     minify: 'terser',
@@ -34,8 +56,26 @@ export default defineConfig({
     cssMinify: true,
     sourcemap: false,
     reportCompressedSize: false,
+    rollupOptions: {
+      output: {
+        entryFileNames: MAIN_BUNDLE_FILE,
+        chunkFileNames: '[name].js',
+        assetFileNames(assetInfo) {
+          if (assetInfo.names.some((name) => path.extname(name).toLowerCase() === '.css')) {
+            return STYLE_BUNDLE_FILE;
+          }
+
+          return 'assets/[name][extname]';
+        },
+      },
+    },
   },
   resolve: {
-    alias: { '@': path.resolve(__dirname, 'src') },
+    alias: [
+      ...(command === 'build'
+        ? [{ find: './chess-runtime.ts', replacement: CHESS_RUNTIME_GLOBAL_PATH }]
+        : []),
+      { find: '@', replacement: path.resolve(__dirname, 'src') },
+    ],
   },
-});
+}));

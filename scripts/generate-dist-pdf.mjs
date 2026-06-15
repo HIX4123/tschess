@@ -1,30 +1,45 @@
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { accessSync, createWriteStream } from 'node:fs';
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import PDFDocument from 'pdfkit';
 import prettier from 'prettier';
 import { createHighlighter } from 'shiki';
+import ts from 'typescript';
 
-const DIST_DIR = path.resolve(process.cwd(), 'dist');
-const OUTPUT_FILE = path.resolve(process.cwd(), 'artifacts', 'build-report.pdf');
+const PROJECT_ROOT = process.cwd();
+const DIST_DIR = path.resolve(PROJECT_ROOT, 'dist');
+const ARTIFACTS_DIR = path.resolve(PROJECT_ROOT, 'artifacts');
+const OUTPUT_FILE = path.resolve(ARTIFACTS_DIR, 'build-report.pdf');
+const NODE_MODULES_DIR = path.resolve(PROJECT_ROOT, 'node_modules');
+const MAIN_BUNDLE_FILE = 'main.js';
+const STYLE_BUNDLE_FILE = 'style.css';
 const FONT_REGULAR_PATH = path.resolve(
-  process.cwd(),
+  PROJECT_ROOT,
   'assets',
   'fonts',
   'D2CodingLigature-Regular.ttf',
 );
-const FONT_BOLD_PATH = path.resolve(
-  process.cwd(),
-  'assets',
-  'fonts',
-  'D2CodingLigature-Bold.ttf',
-);
+const FONT_BOLD_PATH = path.resolve(PROJECT_ROOT, 'assets', 'fonts', 'D2CodingLigature-Bold.ttf');
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 const CODE_FONT_SIZE = 8;
 const CODE_LINE_HEIGHT = 10.8;
+const COMMAND_MAX_BUFFER = 64 * 1024 * 1024;
+const COMMAND_OUTPUT_PREVIEW_LENGTH = 12000;
+const DIFF_TEMP_PREFIX = path.join(tmpdir(), 'tschess-dist-diff-');
 const SHIKI_THEME = 'github-light';
 const SHIKI_LANGS = ['javascript', 'typescript', 'css', 'scss', 'html', 'json', 'xml'];
 const EXTENSION_TO_LANGUAGE = new Map([
@@ -40,7 +55,12 @@ const EXTENSION_TO_LANGUAGE = new Map([
   ['.txt', null],
 ]);
 
-const BRACKET_GRAY_BUCKETS = ['#000000', '#2f2f2f', '#595959', '#808080'];
+const BRACKET_GRAY_BUCKETS = [
+  'oklch(0% 0 0deg / 1)',
+  'oklch(31% 0 0deg / 1)',
+  'oklch(46% 0 0deg / 1)',
+  'oklch(60% 0 0deg / 1)',
+];
 const OPEN_BRACKET_TO_CLOSE = new Map([
   ['(', ')'],
   ['[', ']'],
@@ -51,7 +71,111 @@ const CLOSE_BRACKET_TO_OPEN = new Map([
   [']', '['],
   ['}', '{'],
 ]);
-const NUMBER_TOKEN_PATTERN = /^[-+]?((\d[\d_]*)(\.\d[\d_]*)?|0[xX][\da-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+)$/u;
+const NUMBER_TOKEN_PATTERN =
+  /^[-+]?((\d[\d_]*)(\.\d[\d_]*)?|0[xX][\da-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+)$/u;
+const INLINE_WORKER_CONTENT_NAME = 'jsContent';
+const INLINE_WORKER_SECTION_MARKER = ` :: inline worker ${INLINE_WORKER_CONTENT_NAME} #`;
+const OKLCH_COLOR_PATTERN =
+  /^oklch\(\s*(\d+(?:\.\d+)?)%\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)deg\s*\/\s*(0|1|(?:0?\.\d+))\s*\)$/u;
+const PDF_COLOR_CACHE = new Map();
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function linearSrgbToByte(value) {
+  const clamped = clamp(value, 0, 1);
+  const encoded = clamped <= 0.0031308 ? 12.92 * clamped : 1.055 * clamped ** (1 / 2.4) - 0.055;
+
+  return Math.round(encoded * 255);
+}
+
+function oklchToPdfColor(color) {
+  const cachedColor = PDF_COLOR_CACHE.get(color);
+  if (cachedColor) {
+    return cachedColor;
+  }
+
+  const match = OKLCH_COLOR_PATTERN.exec(color);
+  if (!match) {
+    throw new Error(`Unsupported PDF color format: ${color}`);
+  }
+
+  const lightness = Number(match[1]) / 100;
+  const chroma = Number(match[2]);
+  const hueRadians = (Number(match[3]) * Math.PI) / 180;
+  const alpha = clamp(Number(match[4]), 0, 1);
+  const a = Math.cos(hueRadians) * chroma;
+  const b = Math.sin(hueRadians) * chroma;
+
+  const lPrime = lightness + 0.3963377774 * a + 0.2158037573 * b;
+  const mPrime = lightness - 0.1055613458 * a - 0.0638541728 * b;
+  const sPrime = lightness - 0.0894841775 * a - 1.291485548 * b;
+  const l = lPrime ** 3;
+  const m = mPrime ** 3;
+  const s = sPrime ** 3;
+
+  const result = {
+    channels: [
+      linearSrgbToByte(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+      linearSrgbToByte(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+      linearSrgbToByte(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
+    ],
+    opacity: alpha,
+  };
+
+  PDF_COLOR_CACHE.set(color, result);
+  return result;
+}
+
+function truncateCommandOutput(value) {
+  if (!value || value.length <= COMMAND_OUTPUT_PREVIEW_LENGTH) {
+    return value;
+  }
+
+  return `${value.slice(0, COMMAND_OUTPUT_PREVIEW_LENGTH)}\n... <truncated>`;
+}
+
+function commandToString(command, args) {
+  return [command, ...args].join(' ');
+}
+
+function execFileText(command, args, options = {}) {
+  const { allowedExitCodes = [0], ...execOptions } = options;
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      command,
+      args,
+      {
+        cwd: PROJECT_ROOT,
+        encoding: 'utf8',
+        maxBuffer: COMMAND_MAX_BUFFER,
+        ...execOptions,
+      },
+      (error, stdout, stderr) => {
+        if (error && typeof error.code !== 'number') {
+          reject(error);
+          return;
+        }
+
+        const exitCode = typeof error?.code === 'number' ? error.code : 0;
+
+        if (error && !allowedExitCodes.includes(exitCode)) {
+          const output = truncateCommandOutput(stderr || stdout || error.message);
+          reject(new Error(`Command failed: ${commandToString(command, args)}\n${output}`));
+          return;
+        }
+
+        resolve({ stdout, stderr, exitCode });
+      },
+    );
+  });
+}
+
+function toDisplayPath(filePath) {
+  return path.relative(PROJECT_ROOT, filePath) || '.';
+}
 
 function createSymbols(unicodeCapable) {
   if (!unicodeCapable) {
@@ -81,23 +205,28 @@ function createSymbols(unicodeCapable) {
 
 function createStyles(fonts) {
   return {
-    treeTitle: { color: '#000000', font: fonts.bold },
-    tree: { color: '#111111', font: fonts.regular },
-    sectionHeader: { color: '#111111', font: fonts.bold },
-    separator: { color: '#4a4a4a', font: fonts.regular },
-    lineNumber: { color: '#666666', font: fonts.regular },
-    continuation: { color: '#4d4d4d', font: fonts.regular },
-    whitespaceMarker: { color: '#b8b8b8', font: fonts.regular },
-    indentBoundary: { color: '#8f8f8f', font: fonts.regular },
-    codeDefault: { color: '#111111', font: fonts.regular },
-    comment: { color: '#8a8a8a', font: fonts.italic },
-    keyword: { color: '#0d0d0d', font: fonts.bold },
-    string: { color: '#4a4a4a', font: fonts.regular },
-    number: { color: '#2b2b2b', font: fonts.bold },
-    functionName: { color: '#1d1d1d', font: fonts.bold },
-    typeName: { color: '#323232', font: fonts.bold },
-    tagName: { color: '#252525', font: fonts.bold },
-    attribute: { color: '#575757', font: fonts.regular },
+    treeTitle: { color: 'oklch(0% 0 0deg / 1)', font: fonts.bold },
+    tree: { color: 'oklch(18% 0 0deg / 1)', font: fonts.regular },
+    sectionHeader: { color: 'oklch(18% 0 0deg / 1)', font: fonts.bold },
+    separator: { color: 'oklch(41% 0 0deg / 1)', font: fonts.regular },
+    lineNumber: { color: 'oklch(51% 0 0deg / 1)', font: fonts.regular },
+    continuation: { color: 'oklch(42% 0 0deg / 1)', font: fonts.regular },
+    whitespaceMarker: { color: 'oklch(78% 0 0deg / 1)', font: fonts.regular },
+    indentBoundary: { color: 'oklch(65% 0 0deg / 1)', font: fonts.regular },
+    codeDefault: { color: 'oklch(18% 0 0deg / 1)', font: fonts.regular },
+    comment: { color: 'oklch(63% 0 0deg / 1)', font: fonts.italic },
+    keyword: { color: 'oklch(16% 0 0deg / 1)', font: fonts.bold },
+    string: { color: 'oklch(41% 0 0deg / 1)', font: fonts.regular },
+    number: { color: 'oklch(29% 0 0deg / 1)', font: fonts.bold },
+    functionName: { color: 'oklch(23% 0 0deg / 1)', font: fonts.bold },
+    typeName: { color: 'oklch(32% 0 0deg / 1)', font: fonts.bold },
+    tagName: { color: 'oklch(26% 0 0deg / 1)', font: fonts.bold },
+    attribute: { color: 'oklch(46% 0 0deg / 1)', font: fonts.regular },
+    diffContextMarker: { color: 'oklch(51% 0 0deg / 1)', font: fonts.regular },
+    diffAddMarker: { color: 'oklch(38% 0.12 150deg / 1)', font: fonts.bold },
+    diffDeleteMarker: { color: 'oklch(43% 0.15 28deg / 1)', font: fonts.bold },
+    diffAddBackground: 'oklch(94% 0.03 150deg / 1)',
+    diffDeleteBackground: 'oklch(94% 0.04 28deg / 1)',
   };
 }
 
@@ -138,8 +267,18 @@ class PdfLineRenderer {
     this.bottomY = this.doc.page.height - this.doc.page.margins.bottom;
   }
 
-  writeLine(chars) {
+  writeLine(chars, options = {}) {
     this.ensureLineSpace();
+    if (options.backgroundColor) {
+      const backgroundColor = oklchToPdfColor(options.backgroundColor);
+      this.doc
+        .save()
+        .rect(this.leftX, this.currentY, this.rightX - this.leftX, CODE_LINE_HEIGHT)
+        .fillColor(backgroundColor.channels, backgroundColor.opacity)
+        .fill()
+        .restore();
+    }
+
     if (chars.length === 0) {
       this.currentY += CODE_LINE_HEIGHT;
       return;
@@ -157,10 +296,12 @@ class PdfLineRenderer {
         index += 1;
       }
 
+      const fillColor = oklchToPdfColor(startStyle.color);
+
       this.doc
         .font(startStyle.font)
         .fontSize(CODE_FONT_SIZE)
-        .fillColor(startStyle.color)
+        .fillColor(fillColor.channels, fillColor.opacity)
         .text(text, x, this.currentY, { lineBreak: false });
 
       x += this.doc.widthOfString(text);
@@ -252,9 +393,399 @@ function computeSha12(content) {
   return digest.slice(0, 12);
 }
 
+function computeBufferSha12(buffer) {
+  const digest = createHash('sha256').update(buffer).digest('hex');
+  return digest.slice(0, 12);
+}
+
 function resolveLanguage(relativePath) {
   const extension = path.extname(relativePath).toLowerCase();
   return EXTENSION_TO_LANGUAGE.get(extension) ?? null;
+}
+
+function isStringLiteralLike(node) {
+  return ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node);
+}
+
+function collectInlineWorkerLiterals(sourceFile) {
+  const literals = [];
+
+  function visit(node) {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === INLINE_WORKER_CONTENT_NAME &&
+      node.initializer &&
+      isStringLiteralLike(node.initializer)
+    ) {
+      literals.push(node.initializer);
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return literals;
+}
+
+function applyStringLiteralReplacements(content, replacements) {
+  let output = content;
+  const sortedReplacements = [...replacements].sort((left, right) => right.start - left.start);
+
+  for (const replacement of sortedReplacements) {
+    output = `${output.slice(0, replacement.start)}${replacement.text}${output.slice(replacement.end)}`;
+  }
+
+  return output;
+}
+
+async function extractInlineWorkerSections(relativePath, content) {
+  if (path.extname(relativePath).toLowerCase() !== '.js') {
+    return { displayContent: content, sections: [] };
+  }
+
+  const sourceFile = ts.createSourceFile(
+    relativePath,
+    content,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.JS,
+  );
+  const literals = collectInlineWorkerLiterals(sourceFile);
+
+  if (literals.length === 0) {
+    return { displayContent: content, sections: [] };
+  }
+
+  const replacements = [];
+  const sections = [];
+  let workerIndex = 0;
+
+  for (const literal of literals) {
+    const rawWorkerContent = literal.text;
+
+    try {
+      const formattedWorkerContent = await prettier.format(rawWorkerContent, {
+        parser: 'babel',
+        printWidth: 100,
+        singleQuote: true,
+      });
+      workerIndex += 1;
+
+      const workerLineCount = formattedWorkerContent.split(/\r?\n/u).length;
+      const workerSize = Buffer.byteLength(rawWorkerContent, 'utf8');
+      const title = `${relativePath} :: inline worker ${INLINE_WORKER_CONTENT_NAME} #${workerIndex}`;
+      const placeholder = `[${title} extracted below: ${workerSize} B / ${workerLineCount} lines]`;
+
+      replacements.push({
+        start: literal.getStart(sourceFile),
+        end: literal.end,
+        text: JSON.stringify(placeholder),
+      });
+      sections.push({
+        title,
+        syntaxPath: `${relativePath}.inline-worker-${workerIndex}.js`,
+        content: formattedWorkerContent,
+        size: workerSize,
+        lineCount: workerLineCount,
+      });
+      console.log(
+        `[inline-worker] ${relativePath}: extracted ${INLINE_WORKER_CONTENT_NAME} #${workerIndex}`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[inline-worker-skip] ${relativePath}: ${message}`);
+    }
+  }
+
+  if (sections.length === 0) {
+    return { displayContent: content, sections: [] };
+  }
+
+  return {
+    displayContent: applyStringLiteralReplacements(content, replacements),
+    sections,
+  };
+}
+
+async function createTextFileEntry(filePath, relativePath, content, options = {}) {
+  let finalContent = content;
+
+  try {
+    const prettierConfig = (await prettier.resolveConfig(filePath)) ?? {};
+    const formatted = await prettier.format(content, {
+      ...prettierConfig,
+      filepath: filePath,
+    });
+    if (options.writeFormatted && formatted !== content) {
+      await writeFile(filePath, formatted, 'utf8');
+    }
+    finalContent = formatted;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[format-skip] ${relativePath}: ${message}`);
+  }
+
+  const { displayContent, sections } = await extractInlineWorkerSections(
+    relativePath,
+    finalContent,
+  );
+
+  return {
+    relativePath,
+    size: Buffer.byteLength(finalContent, 'utf8'),
+    content: finalContent,
+    displayContent,
+    inlineWorkerSections: sections,
+    sha12: computeSha12(finalContent),
+  };
+}
+
+async function collectDistTextFiles(distDir, options = {}) {
+  const filePaths = await listFilesRecursively(distDir);
+  const sortedFilePaths = filePaths.sort((a, b) => a.localeCompare(b));
+  const textFiles = [];
+  const fileMetas = new Map();
+
+  for (const filePath of sortedFilePaths) {
+    const relativePath = path.relative(distDir, filePath);
+    const buffer = await readFile(filePath);
+    const rawSha12 = computeBufferSha12(buffer);
+
+    try {
+      const content = readUtf8Strict(buffer);
+      fileMetas.set(relativePath, {
+        kind: 'text',
+        size: buffer.length,
+        sha12: rawSha12,
+      });
+      textFiles.push(
+        await createTextFileEntry(filePath, relativePath, content, {
+          writeFormatted: options.writeFormatted,
+        }),
+      );
+    } catch {
+      fileMetas.set(relativePath, {
+        kind: 'binary',
+        size: buffer.length,
+        sha12: rawSha12,
+      });
+      console.warn(`[skip] ${relativePath}: not valid UTF-8 text`);
+    }
+  }
+
+  return { textFiles, fileMetas };
+}
+
+function createComparableEntries(textFiles) {
+  const entries = new Map();
+
+  for (const file of textFiles) {
+    const displayContent = file.displayContent ?? file.content;
+    entries.set(file.relativePath, {
+      relativePath: file.relativePath,
+      syntaxPath: file.relativePath,
+      content: displayContent,
+      size: Buffer.byteLength(displayContent, 'utf8'),
+      sha12: computeSha12(displayContent),
+    });
+
+    for (const section of file.inlineWorkerSections ?? []) {
+      entries.set(section.title, {
+        relativePath: section.title,
+        syntaxPath: section.syntaxPath,
+        content: section.content,
+        size: Buffer.byteLength(section.content, 'utf8'),
+        sha12: computeSha12(section.content),
+      });
+    }
+  }
+
+  return entries;
+}
+
+async function collectDistSnapshot(distDir, label) {
+  const { textFiles, fileMetas } = await collectDistTextFiles(distDir, {
+    writeFormatted: false,
+  });
+
+  return {
+    label,
+    textFiles,
+    fileMetas,
+    entries: createComparableEntries(textFiles),
+  };
+}
+
+function isSamePath(left, right) {
+  return path.resolve(left) === path.resolve(right);
+}
+
+function assetReferenceVariants(relativePath) {
+  return [relativePath, `./${relativePath}`, `/${relativePath}`];
+}
+
+function replaceAssetReferences(content, oldRelativePath, newRelativePath) {
+  if (oldRelativePath === newRelativePath) {
+    return content;
+  }
+
+  let output = content;
+  for (const oldReference of assetReferenceVariants(oldRelativePath)) {
+    output = output.replaceAll(oldReference, `./${newRelativePath}`);
+  }
+  return output;
+}
+
+function normalizeDistAssetReference(reference) {
+  if (reference.includes('://') || reference.startsWith('../')) {
+    return null;
+  }
+
+  if (reference.startsWith('/') || reference.startsWith('./') || !reference.startsWith('.')) {
+    return reference.replace(/^\.?\//u, '');
+  }
+
+  return null;
+}
+
+function extractAttributeReferences(html, tagName, attributeName) {
+  const references = [];
+  const tagPattern = new RegExp(`<${tagName}\\b([^>]*)>`, 'giu');
+  const attributePattern = new RegExp(
+    `${attributeName}\\s*=\\s*("[^"]*"|'[^']*'|[^\\s"'>]+)`,
+    'iu',
+  );
+  let match;
+
+  while ((match = tagPattern.exec(html)) !== null) {
+    const attributeMatch = attributePattern.exec(match[1]);
+    if (!attributeMatch) {
+      continue;
+    }
+
+    const rawValue = attributeMatch[1];
+    references.push(rawValue.replace(/^["']|["']$/gu, ''));
+  }
+
+  return references;
+}
+
+function findReferencedBundle(html, extension, references) {
+  const bundleReferences = references
+    .map((reference) => normalizeDistAssetReference(reference))
+    .filter((reference) => reference && path.extname(reference).toLowerCase() === extension);
+
+  if (bundleReferences.length !== 1) {
+    throw new Error(
+      `Expected one referenced ${extension} bundle, found: ${bundleReferences.join(', ') || '<none>'}`,
+    );
+  }
+
+  return bundleReferences[0];
+}
+
+async function moveBundleFile(distDir, sourceRelativePath, targetFileName) {
+  const sourceFile = path.join(distDir, sourceRelativePath);
+  const targetFile = path.join(distDir, targetFileName);
+  const oldRelativePath = distRelativePath(distDir, sourceFile);
+
+  if (!isSamePath(sourceFile, targetFile)) {
+    try {
+      accessSync(targetFile);
+      throw new Error(
+        `Cannot canonicalize ${oldRelativePath}; ${targetFileName} already exists in dist.`,
+      );
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+
+    await rename(sourceFile, targetFile);
+  }
+
+  return {
+    oldRelativePath,
+    newRelativePath: targetFileName,
+  };
+}
+
+function removeViteHash(fileName) {
+  const extension = path.extname(fileName);
+  const baseName = fileName.slice(0, -extension.length);
+  return `${baseName.replace(/-[A-Za-z0-9_-]{8}$/u, '')}${extension}`;
+}
+
+async function moveExtraBundleFiles(distDir, extension, reservedNames) {
+  const files = await listFilesRecursively(distDir);
+  const bundleFiles = files
+    .filter((filePath) => path.extname(filePath).toLowerCase() === extension)
+    .sort((a, b) => distRelativePath(distDir, a).localeCompare(distRelativePath(distDir, b)));
+  const moves = [];
+  const usedNames = new Set(reservedNames);
+
+  for (const [index, filePath] of bundleFiles.entries()) {
+    const oldRelativePath = distRelativePath(distDir, filePath);
+    if (reservedNames.has(path.basename(oldRelativePath))) {
+      continue;
+    }
+
+    const stableName = removeViteHash(path.basename(oldRelativePath));
+    const targetFileName = usedNames.has(stableName)
+      ? `chunk-${index + 1}${extension}`
+      : stableName;
+    usedNames.add(targetFileName);
+    moves.push(await moveBundleFile(distDir, oldRelativePath, targetFileName));
+  }
+
+  return moves;
+}
+
+async function rewriteMovedAssetReferences(distDir, moves) {
+  if (moves.length === 0) {
+    return;
+  }
+
+  const files = await listFilesRecursively(distDir);
+  const textFiles = files.filter((filePath) =>
+    ['.html', '.js', '.css'].includes(path.extname(filePath).toLowerCase()),
+  );
+
+  for (const filePath of textFiles) {
+    let content = await readFile(filePath, 'utf8');
+    let nextContent = content;
+
+    for (const move of moves) {
+      nextContent = replaceAssetReferences(nextContent, move.oldRelativePath, move.newRelativePath);
+    }
+
+    if (nextContent !== content) {
+      await writeFile(filePath, nextContent, 'utf8');
+    }
+  }
+}
+
+async function canonicalizeDistBundleNames(distDir) {
+  const htmlFile = path.join(distDir, 'index.html');
+  const html = await readFile(htmlFile, 'utf8');
+  const scriptReference = findReferencedBundle(
+    html,
+    '.js',
+    extractAttributeReferences(html, 'script', 'src'),
+  );
+  const stylesheetReference = findReferencedBundle(
+    html,
+    '.css',
+    extractAttributeReferences(html, 'link', 'href'),
+  );
+  const moves = [
+    await moveBundleFile(distDir, scriptReference, MAIN_BUNDLE_FILE),
+    await moveBundleFile(distDir, stylesheetReference, STYLE_BUNDLE_FILE),
+    ...(await moveExtraBundleFiles(distDir, '.js', new Set([MAIN_BUNDLE_FILE, STYLE_BUNDLE_FILE]))),
+  ];
+
+  await rewriteMovedAssetReferences(distDir, moves);
 }
 
 function extractScopes(token) {
@@ -402,7 +933,9 @@ function applyBracketDepthEmphasis(chars, stack) {
     }
 
     const color =
-      BRACKET_GRAY_BUCKETS[(stack.length - 1 + BRACKET_GRAY_BUCKETS.length) % BRACKET_GRAY_BUCKETS.length];
+      BRACKET_GRAY_BUCKETS[
+        (stack.length - 1 + BRACKET_GRAY_BUCKETS.length) % BRACKET_GRAY_BUCKETS.length
+      ];
     chars[index] = {
       ...chars[index],
       style: { ...chars[index].style, color },
@@ -435,7 +968,7 @@ function buildWrappedLines(contentChars, maxColumns, firstPrefixChars, continuat
 }
 
 async function tokenizeByLine(highlighter, file) {
-  const language = resolveLanguage(file.relativePath);
+  const language = resolveLanguage(file.syntaxPath ?? file.relativePath);
   if (!language) {
     return null;
   }
@@ -563,6 +1096,230 @@ function writeCodeLines(renderer, rawLines, tokenLines, styles, symbols) {
   }
 }
 
+function splitDiffLines(content) {
+  if (content.length === 0) {
+    return [];
+  }
+
+  const normalized = content.replace(/\r\n/gu, '\n').replace(/\r/gu, '\n');
+  const lines = normalized.split('\n');
+  if (lines.at(-1) === '') {
+    lines.pop();
+  }
+
+  return lines;
+}
+
+function parseDiffRange(value, fallbackCount) {
+  const [startText, countText] = value.split(',');
+  return {
+    start: Number(startText),
+    count: countText === undefined ? fallbackCount : Number(countText),
+  };
+}
+
+function parseUnifiedDiffHunks(diffText) {
+  const hunks = [];
+  let currentHunk = null;
+
+  for (const line of diffText.split(/\r?\n/u)) {
+    const headerMatch = line.match(/^@@ -(\d+(?:,\d+)?) \+(\d+(?:,\d+)?) @@/u);
+    if (headerMatch) {
+      const oldRange = parseDiffRange(headerMatch[1], 1);
+      const newRange = parseDiffRange(headerMatch[2], 1);
+      currentHunk = {
+        oldStart: oldRange.start,
+        oldCount: oldRange.count,
+        newStart: newRange.start,
+        newCount: newRange.count,
+        changes: [],
+      };
+      hunks.push(currentHunk);
+      continue;
+    }
+
+    if (!currentHunk || line.length === 0 || line.startsWith('\\')) {
+      continue;
+    }
+
+    const marker = line[0];
+    if (marker === '+' || marker === '-' || marker === ' ') {
+      currentHunk.changes.push({
+        marker,
+        text: line.slice(1),
+      });
+    }
+  }
+
+  return hunks;
+}
+
+function addContextRows(rows, oldLines, newLines, cursors, oldTarget, newTarget) {
+  while (cursors.oldLine < oldTarget && cursors.newLine < newTarget) {
+    rows.push({
+      kind: 'context',
+      oldLine: cursors.oldLine,
+      newLine: cursors.newLine,
+      rawLine: newLines[cursors.newLine - 1] ?? oldLines[cursors.oldLine - 1] ?? '',
+    });
+    cursors.oldLine += 1;
+    cursors.newLine += 1;
+  }
+}
+
+function createDiffRows(oldLines, newLines, hunks) {
+  const rows = [];
+  const cursors = { oldLine: 1, newLine: 1 };
+
+  for (const hunk of hunks) {
+    const oldTarget = hunk.oldCount === 0 ? hunk.oldStart + 1 : hunk.oldStart;
+    const newTarget = hunk.newCount === 0 ? hunk.newStart + 1 : hunk.newStart;
+    addContextRows(rows, oldLines, newLines, cursors, oldTarget, newTarget);
+
+    for (const change of hunk.changes) {
+      if (change.marker === ' ') {
+        rows.push({
+          kind: 'context',
+          oldLine: cursors.oldLine,
+          newLine: cursors.newLine,
+          rawLine: newLines[cursors.newLine - 1] ?? change.text,
+        });
+        cursors.oldLine += 1;
+        cursors.newLine += 1;
+        continue;
+      }
+
+      if (change.marker === '-') {
+        rows.push({
+          kind: 'delete',
+          oldLine: cursors.oldLine,
+          newLine: null,
+          rawLine: oldLines[cursors.oldLine - 1] ?? change.text,
+        });
+        cursors.oldLine += 1;
+        continue;
+      }
+
+      rows.push({
+        kind: 'add',
+        oldLine: null,
+        newLine: cursors.newLine,
+        rawLine: newLines[cursors.newLine - 1] ?? change.text,
+      });
+      cursors.newLine += 1;
+    }
+  }
+
+  while (cursors.oldLine <= oldLines.length && cursors.newLine <= newLines.length) {
+    rows.push({
+      kind: 'context',
+      oldLine: cursors.oldLine,
+      newLine: cursors.newLine,
+      rawLine: newLines[cursors.newLine - 1] ?? oldLines[cursors.oldLine - 1] ?? '',
+    });
+    cursors.oldLine += 1;
+    cursors.newLine += 1;
+  }
+
+  while (cursors.oldLine <= oldLines.length) {
+    rows.push({
+      kind: 'delete',
+      oldLine: cursors.oldLine,
+      newLine: null,
+      rawLine: oldLines[cursors.oldLine - 1] ?? '',
+    });
+    cursors.oldLine += 1;
+  }
+
+  while (cursors.newLine <= newLines.length) {
+    rows.push({
+      kind: 'add',
+      oldLine: null,
+      newLine: cursors.newLine,
+      rawLine: newLines[cursors.newLine - 1] ?? '',
+    });
+    cursors.newLine += 1;
+  }
+
+  return rows;
+}
+
+function createDiffPrefix(row, oldWidth, newWidth, styles) {
+  const oldText =
+    row.oldLine === null ? ''.padStart(oldWidth, ' ') : String(row.oldLine).padStart(oldWidth, ' ');
+  const newText =
+    row.newLine === null ? ''.padStart(newWidth, ' ') : String(row.newLine).padStart(newWidth, ' ');
+  const marker = row.kind === 'add' ? '+' : row.kind === 'delete' ? '-' : ' ';
+  const markerStyle =
+    row.kind === 'add'
+      ? styles.diffAddMarker
+      : row.kind === 'delete'
+        ? styles.diffDeleteMarker
+        : styles.diffContextMarker;
+
+  return [
+    ...toChars(`${oldText} ${newText} `, styles.lineNumber),
+    ...toChars(marker, markerStyle),
+    ...toChars(' | ', styles.lineNumber),
+  ];
+}
+
+function diffRowBackground(row, styles) {
+  if (row.kind === 'add') {
+    return styles.diffAddBackground;
+  }
+  if (row.kind === 'delete') {
+    return styles.diffDeleteBackground;
+  }
+
+  return null;
+}
+
+async function writeDiffCodeRows(renderer, file, highlighter, styles, symbols) {
+  if (file.rows.length === 0) {
+    writePlainWrappedLine(renderer, '[empty file]', styles.tree, styles, symbols);
+    return;
+  }
+
+  const rawLines = file.rows.map((row) => row.rawLine);
+  const tokenLines = await tokenizeByLine(highlighter, {
+    relativePath: file.relativePath,
+    syntaxPath: file.syntaxPath,
+    content: rawLines.join('\n'),
+  });
+  const bracketStack = [];
+  const oldWidth = String(Math.max(1, file.oldLineCount)).length;
+  const newWidth = String(Math.max(1, file.newLineCount)).length;
+  const continuationPrefix = [
+    ...toChars(`${' '.repeat(oldWidth)} ${' '.repeat(newWidth)}   | `, styles.lineNumber),
+    ...toChars(symbols.continuation, styles.continuation),
+  ];
+  const spaceIndentUnit = detectSpaceIndentUnit(rawLines.join('\n'));
+
+  for (const [rowIndex, row] of file.rows.entries()) {
+    const tokens = tokenLines?.[rowIndex] ?? [{ content: row.rawLine, explanation: [] }];
+    const lineChars = visualizeWhitespace(
+      buildLineCharsFromTokens(row.rawLine, tokens, styles),
+      symbols,
+      styles,
+      spaceIndentUnit,
+    );
+
+    applyBracketDepthEmphasis(lineChars, bracketStack);
+
+    const wrappedLines = buildWrappedLines(
+      lineChars,
+      renderer.maxColumns,
+      createDiffPrefix(row, oldWidth, newWidth, styles),
+      continuationPrefix,
+    );
+    const backgroundColor = diffRowBackground(row, styles);
+    for (const physicalLine of wrappedLines) {
+      renderer.writeLine(physicalLine, { backgroundColor });
+    }
+  }
+}
+
 function setupFonts(doc) {
   const fonts = {
     regular: 'Courier',
@@ -591,8 +1348,15 @@ function setupFonts(doc) {
   }
 }
 
-async function generatePdf(textFiles, highlighter) {
-  await mkdir(path.dirname(OUTPUT_FILE), { recursive: true });
+async function createCodeHighlighter() {
+  return createHighlighter({
+    themes: [SHIKI_THEME],
+    langs: SHIKI_LANGS,
+  });
+}
+
+async function generatePdf(textFiles, highlighter, outputFile = OUTPUT_FILE) {
+  await mkdir(path.dirname(outputFile), { recursive: true });
 
   const doc = new PDFDocument({
     size: 'A4',
@@ -600,7 +1364,7 @@ async function generatePdf(textFiles, highlighter) {
     margin: 36,
     autoFirstPage: true,
   });
-  const outputStream = createWriteStream(OUTPUT_FILE);
+  const outputStream = createWriteStream(outputFile);
   doc.pipe(outputStream);
 
   const { fonts, unicodeCapable } = setupFonts(doc);
@@ -614,7 +1378,13 @@ async function generatePdf(textFiles, highlighter) {
     writePlainWrappedLine(renderer, line, style, styles, symbols);
   }
   renderer.writeLine([]);
-  writePlainWrappedLine(renderer, '-'.repeat(renderer.maxColumns), styles.separator, styles, symbols);
+  writePlainWrappedLine(
+    renderer,
+    '-'.repeat(renderer.maxColumns),
+    styles.separator,
+    styles,
+    symbols,
+  );
 
   for (const file of textFiles) {
     renderer.writeLine([]);
@@ -626,9 +1396,31 @@ async function generatePdf(textFiles, highlighter) {
       symbols,
     );
 
-    const rawLines = file.content.split(/\r?\n/u);
-    const tokenLines = await tokenizeByLine(highlighter, file);
+    const rawLines = (file.displayContent ?? file.content).split(/\r?\n/u);
+    const tokenLines = await tokenizeByLine(highlighter, {
+      ...file,
+      content: file.displayContent ?? file.content,
+    });
     writeCodeLines(renderer, rawLines, tokenLines, styles, symbols);
+
+    for (const section of file.inlineWorkerSections ?? []) {
+      renderer.writeLine([]);
+      writePlainWrappedLine(
+        renderer,
+        `==== ${section.title} (display-only / ${section.size} B / ${section.lineCount} lines) ====`,
+        styles.sectionHeader,
+        styles,
+        symbols,
+      );
+
+      const sectionLines = section.content.split(/\r?\n/u);
+      const sectionTokens = await tokenizeByLine(highlighter, {
+        relativePath: section.title,
+        syntaxPath: section.syntaxPath,
+        content: section.content,
+      });
+      writeCodeLines(renderer, sectionLines, sectionTokens, styles, symbols);
+    }
   }
 
   await new Promise((resolve, reject) => {
@@ -639,58 +1431,471 @@ async function generatePdf(textFiles, highlighter) {
   });
 }
 
-async function main() {
-  const filePaths = await listFilesRecursively(DIST_DIR);
-  const sortedFilePaths = filePaths.sort((a, b) => a.localeCompare(b));
-  const textFiles = [];
+function distRelativePath(distDir, filePath) {
+  return path.relative(distDir, filePath).split(path.sep).join('/');
+}
 
-  for (const filePath of sortedFilePaths) {
-    const relativePath = path.relative(DIST_DIR, filePath);
-    const buffer = await readFile(filePath);
+function statusShort(status) {
+  if (status === 'added') {
+    return 'A';
+  }
+  if (status === 'deleted') {
+    return 'D';
+  }
+  return 'M';
+}
 
-    try {
-      const content = readUtf8Strict(buffer);
-      let finalContent = content;
+function sideSummary(side) {
+  if (!side.exists) {
+    return '-';
+  }
+  return `${side.size} B / ${side.sha12}`;
+}
 
-      try {
-        const prettierConfig = (await prettier.resolveConfig(filePath)) ?? {};
-        const formatted = await prettier.format(content, {
-          ...prettierConfig,
-          filepath: filePath,
-        });
-        if (formatted !== content) {
-          await writeFile(filePath, formatted, 'utf8');
-        }
-        finalContent = formatted;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[format-skip] ${relativePath}: ${message}`);
-      }
+function statusForEntries(oldEntry, newEntry) {
+  if (!oldEntry) {
+    return 'added';
+  }
+  if (!newEntry) {
+    return 'deleted';
+  }
+  return 'modified';
+}
 
-      textFiles.push({
-        relativePath,
-        size: Buffer.byteLength(finalContent, 'utf8'),
-        content: finalContent,
-        sha12: computeSha12(finalContent),
-      });
-    } catch {
-      console.warn(`[skip] ${relativePath}: not valid UTF-8 text`);
+function entryToDiffSide(entry) {
+  if (!entry) {
+    return {
+      exists: false,
+      content: '',
+      lines: [],
+      size: 0,
+      sha12: null,
+    };
+  }
+
+  return {
+    exists: true,
+    content: entry.content,
+    lines: splitDiffLines(entry.content),
+    size: entry.size,
+    sha12: entry.sha12,
+  };
+}
+
+function diffTempFileName(index, relativePath, side) {
+  const digest = createHash('sha256').update(relativePath).digest('hex').slice(0, 12);
+  return `${String(index).padStart(4, '0')}-${digest}.${side}`;
+}
+
+async function writeEntryDiffTempFile(diffWorkDir, index, relativePath, side, entry) {
+  if (!entry) {
+    return '/dev/null';
+  }
+
+  const filePath = path.join(diffWorkDir, diffTempFileName(index, relativePath, side));
+  await writeFile(filePath, entry.content, 'utf8');
+  return filePath;
+}
+
+async function buildEntryDiff(relativePath, oldEntry, newEntry, diffWorkDir, index) {
+  const status = statusForEntries(oldEntry, newEntry);
+
+  if (oldEntry && newEntry && oldEntry.content === newEntry.content) {
+    return null;
+  }
+
+  const oldSide = entryToDiffSide(oldEntry);
+  const newSide = entryToDiffSide(newEntry);
+  const oldDiffPath = await writeEntryDiffTempFile(
+    diffWorkDir,
+    index,
+    relativePath,
+    'old',
+    oldEntry,
+  );
+  const newDiffPath = await writeEntryDiffTempFile(
+    diffWorkDir,
+    index,
+    relativePath,
+    'new',
+    newEntry,
+  );
+  const { stdout } = await execFileText(
+    'git',
+    ['diff', '--no-index', '--unified=0', '--no-color', '--', oldDiffPath, newDiffPath],
+    { allowedExitCodes: [0, 1] },
+  );
+  const hunks = parseUnifiedDiffHunks(stdout);
+  const rows = createDiffRows(oldSide.lines, newSide.lines, hunks);
+  const syntaxPath = newEntry?.syntaxPath ?? oldEntry?.syntaxPath ?? relativePath;
+
+  return {
+    relativePath,
+    syntaxPath,
+    status,
+    oldSide,
+    newSide,
+    oldLineCount: oldSide.lines.length,
+    newLineCount: newSide.lines.length,
+    rows,
+  };
+}
+
+function buildSnapshotSkippedFiles(oldSnapshot, newSnapshot) {
+  const relativePaths = [
+    ...new Set([...oldSnapshot.fileMetas.keys(), ...newSnapshot.fileMetas.keys()]),
+  ].sort((a, b) => a.localeCompare(b));
+  const skippedFiles = [];
+
+  for (const relativePath of relativePaths) {
+    const oldMeta = oldSnapshot.fileMetas.get(relativePath);
+    const newMeta = newSnapshot.fileMetas.get(relativePath);
+
+    if (oldMeta?.kind !== 'binary' && newMeta?.kind !== 'binary') {
+      continue;
+    }
+    if (oldMeta && newMeta && oldMeta.size === newMeta.size && oldMeta.sha12 === newMeta.sha12) {
+      continue;
+    }
+
+    skippedFiles.push({
+      relativePath,
+      status: statusForEntries(oldMeta, newMeta),
+      reason: 'not valid UTF-8 text',
+    });
+  }
+
+  return skippedFiles;
+}
+
+async function buildSnapshotDiffFiles(oldSnapshot, newSnapshot, diffWorkDir) {
+  await mkdir(diffWorkDir, { recursive: true });
+
+  const relativePaths = [
+    ...new Set([...oldSnapshot.entries.keys(), ...newSnapshot.entries.keys()]),
+  ].sort((a, b) => a.localeCompare(b));
+  const files = [];
+
+  for (const [index, relativePath] of relativePaths.entries()) {
+    const diffFile = await buildEntryDiff(
+      relativePath,
+      oldSnapshot.entries.get(relativePath),
+      newSnapshot.entries.get(relativePath),
+      diffWorkDir,
+      index + 1,
+    );
+
+    if (diffFile) {
+      files.push(diffFile);
     }
   }
+
+  return {
+    files,
+    skippedFiles: buildSnapshotSkippedFiles(oldSnapshot, newSnapshot),
+  };
+}
+
+function diffOutputFileName(fromCommit, toCommit) {
+  return path.join(ARTIFACTS_DIR, `dist-diff-${fromCommit.short}-${toCommit.short}.pdf`);
+}
+
+async function resolveCommit(ref) {
+  const { stdout: fullStdout } = await execFileText('git', [
+    'rev-parse',
+    '--verify',
+    `${ref}^{commit}`,
+  ]);
+  const sha = fullStdout.trim();
+  const { stdout: shortStdout } = await execFileText('git', ['rev-parse', '--short=12', sha]);
+
+  return {
+    ref,
+    sha,
+    short: shortStdout.trim(),
+  };
+}
+
+async function extractCommitArchive(commit, checkoutDir, tempRoot) {
+  await mkdir(checkoutDir, { recursive: true });
+  const archivePath = path.join(tempRoot, `${commit.short}.tar`);
+  await execFileText('git', ['archive', '--format=tar', `--output=${archivePath}`, commit.sha]);
+  await execFileText('tar', ['-xf', archivePath, '-C', checkoutDir]);
+  await rm(archivePath, { force: true });
+}
+
+async function linkCurrentNodeModules(checkoutDir) {
+  try {
+    accessSync(NODE_MODULES_DIR);
+    await symlink(NODE_MODULES_DIR, path.join(checkoutDir, 'node_modules'), 'dir');
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[node_modules-skip] ${message}`);
+    return false;
+  }
+}
+
+async function runBuildWithDependencyFallback(commit, checkoutDir) {
+  const nodeModulesPath = path.join(checkoutDir, 'node_modules');
+  const linkedNodeModules = await linkCurrentNodeModules(checkoutDir);
+
+  try {
+    console.log(`[build] ${commit.ref} (${commit.short}) using current node_modules`);
+    await execFileText('npm', ['run', 'build'], { cwd: checkoutDir });
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[build-retry] ${commit.ref} (${commit.short}): ${message}`);
+  }
+
+  if (linkedNodeModules) {
+    await rm(nodeModulesPath, { recursive: true, force: true });
+  }
+
+  console.log(`[npm-ci] ${commit.ref} (${commit.short})`);
+  await execFileText('npm', ['ci'], { cwd: checkoutDir });
+  console.log(`[build] ${commit.ref} (${commit.short}) after npm ci`);
+  await execFileText('npm', ['run', 'build'], { cwd: checkoutDir });
+}
+
+async function buildCommitDist(commit, tempRoot) {
+  const checkoutDir = path.join(tempRoot, commit.short);
+  await extractCommitArchive(commit, checkoutDir, tempRoot);
+  await runBuildWithDependencyFallback(commit, checkoutDir);
+
+  const distDir = path.join(checkoutDir, 'dist');
+  accessSync(distDir);
+  await canonicalizeDistBundleNames(distDir);
+  return { checkoutDir, distDir };
+}
+
+function resolveOutputFile(outputFile) {
+  if (!outputFile) {
+    return null;
+  }
+  return path.isAbsolute(outputFile) ? outputFile : path.resolve(PROJECT_ROOT, outputFile);
+}
+
+function parseCliArgs(argv) {
+  if (argv.length === 0) {
+    return { mode: 'report' };
+  }
+
+  if (argv[0] !== '--diff') {
+    throw new Error(
+      'Usage: node scripts/generate-dist-pdf.mjs [--diff <from> <to> [--output <pdf>] [--keep-temp]]',
+    );
+  }
+
+  const refs = [];
+  let outputFile = null;
+  let keepTemp = false;
+
+  for (let index = 1; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (arg === '--keep-temp') {
+      keepTemp = true;
+      continue;
+    }
+
+    if (arg === '--output') {
+      const value = argv[index + 1];
+      if (!value) {
+        throw new Error('--output requires a PDF path.');
+      }
+      outputFile = resolveOutputFile(value);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+
+    refs.push(arg);
+  }
+
+  if (refs.length !== 2) {
+    throw new Error('--diff requires exactly two refs: <from> <to>.');
+  }
+
+  return {
+    mode: 'diff',
+    fromRef: refs[0],
+    toRef: refs[1],
+    outputFile,
+    keepTemp,
+  };
+}
+
+function writeDiffSummary(renderer, report, styles, symbols) {
+  const summaryLines = [
+    'Dist Diff',
+    `from: ${report.from.ref} (${report.from.short})`,
+    `to: ${report.to.ref} (${report.to.short})`,
+    `changed rendered sections: ${report.files.length}`,
+    `skipped binary/non-UTF-8 files: ${report.skippedFiles.length}`,
+  ];
+
+  for (const [index, line] of summaryLines.entries()) {
+    writePlainWrappedLine(
+      renderer,
+      line,
+      index === 0 ? styles.treeTitle : styles.tree,
+      styles,
+      symbols,
+    );
+  }
+
+  if (report.files.length > 0) {
+    renderer.writeLine([]);
+    writePlainWrappedLine(renderer, 'Changed Files', styles.treeTitle, styles, symbols);
+    for (const file of report.files) {
+      writePlainWrappedLine(
+        renderer,
+        `${statusShort(file.status)} ${file.relativePath} (${sideSummary(file.oldSide)} -> ${sideSummary(
+          file.newSide,
+        )})`,
+        styles.tree,
+        styles,
+        symbols,
+      );
+    }
+  }
+
+  if (report.skippedFiles.length > 0) {
+    renderer.writeLine([]);
+    writePlainWrappedLine(renderer, 'Skipped Files', styles.treeTitle, styles, symbols);
+    for (const file of report.skippedFiles) {
+      writePlainWrappedLine(
+        renderer,
+        `${statusShort(file.status)} ${file.relativePath}: ${file.reason}`,
+        styles.tree,
+        styles,
+        symbols,
+      );
+    }
+  }
+}
+
+async function generateDiffPdf(report, highlighter) {
+  await mkdir(path.dirname(report.outputFile), { recursive: true });
+
+  const doc = new PDFDocument({
+    size: 'A4',
+    layout: 'portrait',
+    margin: 36,
+    autoFirstPage: true,
+  });
+  const outputStream = createWriteStream(report.outputFile);
+  doc.pipe(outputStream);
+
+  const { fonts, unicodeCapable } = setupFonts(doc);
+  const styles = createStyles(fonts);
+  const symbols = createSymbols(unicodeCapable);
+  const renderer = new PdfLineRenderer(doc, fonts.regular);
+
+  writeDiffSummary(renderer, report, styles, symbols);
+  renderer.writeLine([]);
+  writePlainWrappedLine(
+    renderer,
+    '-'.repeat(renderer.maxColumns),
+    styles.separator,
+    styles,
+    symbols,
+  );
+
+  for (const file of report.files) {
+    renderer.writeLine([]);
+    writePlainWrappedLine(
+      renderer,
+      `==== ${statusShort(file.status)} ${file.relativePath} (${sideSummary(
+        file.oldSide,
+      )} -> ${sideSummary(file.newSide)}) ====`,
+      styles.sectionHeader,
+      styles,
+      symbols,
+    );
+
+    if (file.rows.length === 0) {
+      writePlainWrappedLine(renderer, '[no text rows]', styles.tree, styles, symbols);
+      continue;
+    }
+
+    await writeDiffCodeRows(renderer, file, highlighter, styles, symbols);
+  }
+
+  await new Promise((resolve, reject) => {
+    outputStream.on('finish', resolve);
+    outputStream.on('error', reject);
+    doc.on('error', reject);
+    doc.end();
+  });
+}
+
+async function generateDistDiffReport(options) {
+  const from = await resolveCommit(options.fromRef);
+  const to = await resolveCommit(options.toRef);
+  const outputFile = options.outputFile ?? diffOutputFileName(from, to);
+  const tempRoot = await mkdtemp(DIFF_TEMP_PREFIX);
+
+  try {
+    const fromBuild = await buildCommitDist(from, tempRoot);
+    const toBuild = await buildCommitDist(to, tempRoot);
+    const fromSnapshot = await collectDistSnapshot(fromBuild.distDir, from.short);
+    const toSnapshot = await collectDistSnapshot(toBuild.distDir, to.short);
+    const { files, skippedFiles } = await buildSnapshotDiffFiles(
+      fromSnapshot,
+      toSnapshot,
+      path.join(tempRoot, 'rendered-diff'),
+    );
+    const highlighter = await createCodeHighlighter();
+
+    await generateDiffPdf(
+      {
+        from,
+        to,
+        files,
+        skippedFiles,
+        outputFile,
+      },
+      highlighter,
+    );
+    console.log(
+      `PDF diff report generated: ${toDisplayPath(outputFile)} (${files.length} changed rendered sections, ${skippedFiles.length} skipped)`,
+    );
+  } finally {
+    if (options.keepTemp) {
+      console.log(`[keep-temp] ${tempRoot}`);
+    } else {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+async function generateCurrentDistReport() {
+  const { textFiles } = await collectDistTextFiles(DIST_DIR, { writeFormatted: true });
 
   if (textFiles.length === 0) {
     throw new Error('No UTF-8 text files found under dist.');
   }
 
-  const highlighter = await createHighlighter({
-    themes: [SHIKI_THEME],
-    langs: SHIKI_LANGS,
-  });
+  const highlighter = await createCodeHighlighter();
 
   await generatePdf(textFiles, highlighter);
-  console.log(
-    `PDF report generated: ${path.relative(process.cwd(), OUTPUT_FILE)} (${textFiles.length} files)`,
-  );
+  console.log(`PDF report generated: ${toDisplayPath(OUTPUT_FILE)} (${textFiles.length} files)`);
+}
+
+async function main() {
+  const options = parseCliArgs(process.argv.slice(2));
+  if (options.mode === 'diff') {
+    await generateDistDiffReport(options);
+    return;
+  }
+
+  await generateCurrentDistReport();
 }
 
 main().catch((error) => {

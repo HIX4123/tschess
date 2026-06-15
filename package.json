@@ -1,17 +1,19 @@
 {
   "name": "react-scss-template",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run typecheck && vite build",
+    "build": "npm run typecheck && vite build && node scripts/prepare-file-url-dist.mjs && npm run verify:colors",
     "build:pdf": "npm run build && node scripts/generate-dist-pdf.mjs",
+    "build:pdf:diff": "node scripts/generate-dist-pdf.mjs --diff",
     "preview": "vite preview",
     "lint": "eslint .",
     "format": "prettier --write .",
     "rg": "ripgrep",
-    "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.test.json --noEmit"
+    "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "verify:colors": "node scripts/verify-oklch-colors.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",

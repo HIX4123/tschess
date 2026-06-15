@@ -17,7 +17,7 @@ import {
   type Move,
   type PieceSymbol,
   type Square,
-} from './chess-core.ts';
+} from './chess-runtime.ts';
 
 type GameMode = 'local' | 'ai';
 type ClockPreset = '1/1' | '3/2' | '5/3' | '10/5' | '15/10';
@@ -33,6 +33,9 @@ type PromotionRequest = {
   to: Square;
   moves: Move[];
 };
+type WeightedOpeningMove = AiMoveCommand & {
+  weight: number;
+};
 
 const BOARD_FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] as const;
 const BLACK_FILES = [...BOARD_FILES].reverse();
@@ -45,6 +48,15 @@ const DEFAULT_CLOCK_PRESET: ClockPreset = '10/5';
 const DEBUG_MATE_SCORE_THRESHOLD = 900_000;
 const TEXT_SEPARATOR = ' \u00B7 ';
 const SQUARE_SET = new Set<string>(SQUARES);
+// Weights are Stockfish cp values from Lichess cloud eval for the standard start position.
+const AI_WHITE_OPENING_PRESET: WeightedOpeningMove[] = [
+  { from: 'e2', to: 'e4', weight: 28 },
+  { from: 'd2', to: 'd4', weight: 25 },
+  { from: 'g1', to: 'f3', weight: 24 },
+  { from: 'c2', to: 'c4', weight: 20 },
+  { from: 'g2', to: 'g3', weight: 9 },
+  { from: 'b2', to: 'b3', weight: 6 },
+];
 const CLOCK_PRESETS: Record<ClockPreset, ClockConfig> = {
   '1/1': { baseMs: 60_000, incrementMs: 1_000 },
   '3/2': { baseMs: 180_000, incrementMs: 2_000 },
@@ -346,6 +358,10 @@ export function createChessApp(): void {
       return;
     }
 
+    if (tryCommitAiWhiteOpeningPreset()) {
+      return;
+    }
+
     aiThinking = true;
     aiProgress = null;
     render();
@@ -354,6 +370,29 @@ export function createChessApp(): void {
       aiTimerId = null;
       startAiSearch();
     }, AI_DELAY_MS);
+  }
+
+  function tryCommitAiWhiteOpeningPreset(): boolean {
+    if (humanColor !== 'b' || game.turn() !== 'w' || game.history().length > 0) {
+      return false;
+    }
+
+    const legalPresetMoves = AI_WHITE_OPENING_PRESET.filter((presetMove) =>
+      game
+        .moves({ verbose: true, square: presetMove.from })
+        .some((move) => isSameMoveCommand(move, presetMove)),
+    );
+    const selectedMove = pickWeightedOpeningMove(legalPresetMoves);
+
+    if (!selectedMove || !commitMove(selectedMove)) {
+      return false;
+    }
+
+    aiProgress = null;
+    clearSelection();
+    render();
+
+    return true;
   }
 
   function cancelAiMove(): void {
@@ -473,17 +512,11 @@ export function createChessApp(): void {
     const remainingMs = clockMs[aiColor];
     const incrementMs = CLOCK_PRESETS[clockPreset].incrementMs;
     const targetMs = remainingMs / 30 + incrementMs * 0.8;
-    const remainingSearchBudgetMs = Math.max(500, remainingMs - 250);
-    const softTimeLimitMs = Math.min(Math.max(targetMs, 800), 6_000, remainingSearchBudgetMs);
-    const timeLimitMs = Math.min(
-      Math.max(softTimeLimitMs * 1.8, 1_200),
-      10_000,
-      remainingSearchBudgetMs,
-    );
+    const timeLimitMs =
+      remainingMs <= 3_000 ? Math.min(targetMs, remainingMs * 0.35) : targetMs;
 
     return normalizeAiSettings({
       ...settings,
-      softTimeLimitMs,
       timeLimitMs,
     });
   }
@@ -598,8 +631,9 @@ export function createChessApp(): void {
       button.setAttribute('aria-pressed', String(isActive));
     });
 
-    aiDepthInput.value = String(aiSettings.maxDepth);
-    aiDepthValue.textContent = `${aiSettings.maxDepth}`;
+    aiDepthInput.value = aiSettings.preset === 'hard' ? aiDepthInput.max : String(aiSettings.maxDepth);
+    aiDepthInput.disabled = aiSettings.preset === 'hard';
+    aiDepthValue.textContent = aiSettings.preset === 'hard' ? '무제한' : `${aiSettings.maxDepth}`;
     aiTimeInput.value = String(aiSettings.timeLimitMs);
     aiTimeInput.disabled = aiSettings.preset === 'hard';
     aiTimeValue.textContent =
@@ -781,11 +815,11 @@ export function createChessApp(): void {
     const sanCell = createAiCandidateCell('ai-candidate-san', candidate.san);
 
     if (candidate.selected) {
-      sanCell.appendChild(createAiCandidateBadge('SEL'));
+      sanCell.appendChild(createAiCandidateBadge('선택'));
     }
 
     if (candidate.principal) {
-      sanCell.appendChild(createAiCandidateBadge('PV'));
+      sanCell.appendChild(createAiCandidateBadge('최선'));
     }
 
     row.append(
@@ -998,6 +1032,28 @@ function toSquare(file: BoardFile, rank: BoardRank): Square {
   return `${file}${rank}` as Square;
 }
 
+function pickWeightedOpeningMove(moves: WeightedOpeningMove[]): AiMoveCommand | null {
+  const totalWeight = moves.reduce((total, move) => total + move.weight, 0);
+
+  if (totalWeight <= 0) {
+    return null;
+  }
+
+  let draw = Math.random() * totalWeight;
+
+  for (const move of moves) {
+    draw -= move.weight;
+
+    if (draw <= 0) {
+      return { from: move.from, to: move.to, promotion: move.promotion };
+    }
+  }
+
+  const fallback = moves.at(-1);
+
+  return fallback ? { from: fallback.from, to: fallback.to, promotion: fallback.promotion } : null;
+}
+
 function isSquare(value: string | undefined): value is Square {
   return typeof value === 'string' && SQUARE_SET.has(value);
 }
@@ -1025,13 +1081,21 @@ function isClockPreset(value: string | undefined): value is ClockPreset {
 }
 
 function toAiDepth(value: number): AiSettings['maxDepth'] {
-  return Math.min(5, Math.max(1, Math.round(value))) as AiSettings['maxDepth'];
+  return Math.min(5, Math.max(1, Math.round(value)));
 }
 
 function createClockState(preset: ClockPreset): Record<Color, number> {
   const baseMs = CLOCK_PRESETS[preset].baseMs;
 
   return { w: baseMs, b: baseMs };
+}
+
+function isSameMoveCommand(move: Move, command: AiMoveCommand): boolean {
+  return (
+    move.from === command.from &&
+    move.to === command.to &&
+    (move.promotion ?? undefined) === (command.promotion ?? undefined)
+  );
 }
 
 function colorName(color: Color): string {
@@ -1071,10 +1135,6 @@ function formatClockTime(milliseconds: number): string {
 
 function formatNodes(nodes: number): string {
   if (nodes >= 1_000_000) {
-    return `${(nodes / 1_000_000).toFixed(1)}M`;
-  }
-
-  if (nodes >= 1_000) {
     return `${Math.round(nodes / 1_000)}k`;
   }
 
@@ -1083,7 +1143,7 @@ function formatNodes(nodes: number): string {
 
 function formatDebugScore(score: number): string {
   if (Math.abs(score) >= DEBUG_MATE_SCORE_THRESHOLD) {
-    return score > 0 ? '+mate-ish' : '-mate-ish';
+    return score > 0 ? '+mate' : '-mate';
   }
 
   return score > 0 ? `+${Math.round(score)}` : String(Math.round(score));

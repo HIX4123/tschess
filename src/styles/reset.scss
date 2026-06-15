@@ -6,13 +6,17 @@
 
 html {
   min-width: 1280px;
+  min-height: 100%;
+  background: var(--page);
   color-scheme: light;
 }
 
 body {
   min-width: 1280px;
-  min-height: 720px;
+  min-height: 100vh;
+  min-height: 100dvh;
   margin: 0;
+  background: var(--page);
   font-family:
     Inter,
     ui-sans-serif,

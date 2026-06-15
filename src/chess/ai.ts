@@ -1,13 +1,6 @@
-import {
-  Chess,
-  type Color,
-  type Move,
-  type PieceSymbol,
-  type Square,
-} from './chess-core.ts';
+import { Chess, type Color, type Move, type PieceSymbol, type Square } from './chess-runtime.ts';
 
 export type AiPreset = 'easy' | 'normal' | 'hard';
-export type AiDepth = 1 | 2 | 3 | 4 | 5;  
 export type AiMoveCommand = {
   from: Square;
   to: Square;
@@ -15,9 +8,8 @@ export type AiMoveCommand = {
 };
 export type AiSettings = {
   preset: AiPreset;
-  maxDepth: AiDepth;
+  maxDepth: number;
   timeLimitMs: number;
-  softTimeLimitMs?: number;
   randomness: number;
   quiescence: boolean;
 };
@@ -95,6 +87,7 @@ type PawnInfo = {
 };
 
 const MAX_RANDOMNESS = 30;
+const HARD_MAX_DEPTH = Number.POSITIVE_INFINITY;
 
 export const AI_PRESETS: Record<AiPreset, AiSettings> = {
   easy: {
@@ -113,7 +106,7 @@ export const AI_PRESETS: Record<AiPreset, AiSettings> = {
   },
   hard: {
     preset: 'hard',
-    maxDepth: 5,
+    maxDepth: HARD_MAX_DEPTH,
     timeLimitMs: 5_000,
     randomness: MAX_RANDOMNESS,
     quiescence: true,
@@ -142,11 +135,11 @@ const RANDOM_WINDOW_RANGE_CP = 150;
 const RANDOM_TICKET_POWER_MAX = 4;
 const RANDOM_TICKET_POWER_RANGE = 1.5;
 const MATE_RANDOM_PROTECTION_SCORE = MATE_SCORE - 10_000;
-const ADAPTIVE_MIN_DEPTH = 2;
-const ADAPTIVE_CLEAR_GAP_CP = 120;
-const ADAPTIVE_TACTICAL_GAP_CP = 220;
-const ADAPTIVE_SCORE_SWING_CP = 90;
-const ADAPTIVE_TACTICAL_RATIO = 0.35;
+const STABLE_DEPTH_SCORE_SWING_CP = 90;
+const STABLE_DEPTH_CLEAR_GAP_CP = 120;
+const STARTING_NON_PAWN_MATERIAL =
+  2 * (PIECE_VALUES.q + 2 * PIECE_VALUES.r + 2 * PIECE_VALUES.b + 2 * PIECE_VALUES.n);
+const OPENING_PHASE_END_MATERIAL = STARTING_NON_PAWN_MATERIAL / 2;
 
 export function searchBestMove(
   request: AiRequest,
@@ -207,17 +200,7 @@ export function searchBestMove(
         elapsedMs,
       );
 
-      if (
-        shouldStopAfterSoftLimit(
-          chess,
-          legalMoves,
-          result,
-          previousPrincipal,
-          depth,
-          elapsedMs,
-          settings,
-        )
-      ) {
+      if (shouldStopAfterStableDepth(result, previousPrincipal, settings)) {
         break;
       }
 
@@ -249,20 +232,12 @@ export function searchBestMove(
 }
 
 export function normalizeAiSettings(settings: AiSettings): AiSettings {
-  const timeLimitMs = clamp(Math.round(settings.timeLimitMs), 500, 10_000);
-  const softTimeLimitMs =
-    settings.softTimeLimitMs === undefined
-      ? undefined
-      : Math.min(
-          timeLimitMs,
-          clamp(Math.round(settings.softTimeLimitMs), 500, 10_000),
-        );
+  const timeLimitMs = Math.max(100, Math.round(settings.timeLimitMs));
 
   return {
     preset: settings.preset,
-    maxDepth: clampDepth(settings.maxDepth),
+    maxDepth: normalizeMaxDepth(settings.maxDepth, settings.preset),
     timeLimitMs,
-    ...(softTimeLimitMs === undefined ? {} : { softTimeLimitMs }),
     randomness: MAX_RANDOMNESS,
     quiescence: true,
   };
@@ -281,14 +256,7 @@ function searchRoot(
     checkTime(ctx);
     chess.move(toMoveCommand(move));
 
-    const score = -negamax(
-      chess,
-      depth - 1,
-      -INFINITY_SCORE,
-      INFINITY_SCORE,
-      1,
-      ctx,
-    );
+    const score = -negamax(chess, depth - 1, -INFINITY_SCORE, INFINITY_SCORE, 1, ctx);
 
     chess.undo();
 
@@ -309,51 +277,26 @@ function searchRoot(
   };
 }
 
-function shouldStopAfterSoftLimit(
-  chess: Chess,
-  rootMoves: Move[],
+function shouldStopAfterStableDepth(
   result: RootSearchResult,
   previousPrincipal: SearchResult | null,
-  depth: number,
-  elapsedMs: number,
   settings: AiSettings,
 ): boolean {
-  if (
-    settings.preset !== 'hard' ||
-    settings.softTimeLimitMs === undefined ||
-    elapsedMs < settings.softTimeLimitMs ||
-    depth < ADAPTIVE_MIN_DEPTH
-  ) {
+  if (settings.preset !== 'hard' || previousPrincipal === null) {
     return false;
   }
 
-  if (chess.isCheck() || result.principal.score < 0) {
+  if (!isSameMoveCommand(previousPrincipal.move, result.principal.move)) {
     return false;
   }
 
   if (
-    previousPrincipal === null ||
-    !isSameMoveCommand(previousPrincipal.move, result.principal.move) ||
-    Math.abs(previousPrincipal.score - result.principal.score) >
-      ADAPTIVE_SCORE_SWING_CP
+    Math.abs(previousPrincipal.score - result.principal.score) > STABLE_DEPTH_SCORE_SWING_CP
   ) {
     return false;
   }
 
-  const scoreGap = rootScoreGap(result.debug);
-
-  if (scoreGap < ADAPTIVE_CLEAR_GAP_CP) {
-    return false;
-  }
-
-  if (
-    tacticalMoveRatio(rootMoves) >= ADAPTIVE_TACTICAL_RATIO &&
-    scoreGap < ADAPTIVE_TACTICAL_GAP_CP
-  ) {
-    return false;
-  }
-
-  return true;
+  return rootScoreGap(result.debug) >= STABLE_DEPTH_CLEAR_GAP_CP;
 }
 
 function rootScoreGap(debug: AiDebugInfo): number {
@@ -364,16 +307,6 @@ function rootScoreGap(debug: AiDebugInfo): number {
   }
 
   return bestCandidate.score - secondCandidate.score;
-}
-
-function tacticalMoveRatio(moves: Move[]): number {
-  if (moves.length === 0) {
-    return 0;
-  }
-
-  const tacticalMoveCount = moves.filter(isTacticalMove).length;
-
-  return tacticalMoveCount / moves.length;
 }
 
 function negamax(
@@ -403,14 +336,7 @@ function negamax(
   for (const move of legalMoves) {
     chess.move(toMoveCommand(move));
 
-    const score = -negamax(
-      chess,
-      depth - 1,
-      -beta,
-      -currentAlpha,
-      ply + 1,
-      ctx,
-    );
+    const score = -negamax(chess, depth - 1, -beta, -currentAlpha, ply + 1, ctx);
 
     chess.undo();
 
@@ -452,9 +378,7 @@ function quiescence(
   }
 
   const legalMoves = orderMoves(chess.moves({ verbose: true }), null);
-  const tacticalMoves = chess.isCheck()
-    ? legalMoves
-    : legalMoves.filter(isTacticalMove);
+  const tacticalMoves = chess.isCheck() ? legalMoves : legalMoves.filter(isTacticalMove);
 
   for (const move of tacticalMoves) {
     chess.move(toMoveCommand(move));
@@ -523,6 +447,9 @@ function evaluatePosition(chess: Chess): number {
   whiteScore += pawnStructureScore(pawns, 'w');
   blackScore += pawnStructureScore(pawns, 'b');
 
+  whiteScore += openingPrinciplesScore(board, pawns, 'w', nonPawnMaterial);
+  blackScore += openingPrinciplesScore(board, pawns, 'b', nonPawnMaterial);
+
   whiteScore += developmentScore(board, 'w');
   blackScore += developmentScore(board, 'b');
 
@@ -541,11 +468,7 @@ function evaluatePosition(chess: Chess): number {
   return score;
 }
 
-function pieceSquareScore(
-  type: PieceSymbol,
-  color: Color,
-  square: Square,
-): number {
+function pieceSquareScore(type: PieceSymbol, color: Color, square: Square): number {
   const file = fileIndex(square);
   const relativeRank = color === 'w' ? rankNumber(square) : 9 - rankNumber(square);
   const centerDistance = Math.abs(file - 3.5) + Math.abs(rankNumber(square) - 4.5);
@@ -582,10 +505,7 @@ function pawnStructureScore(pawns: PawnInfo[], color: Color): number {
       score -= 14;
     }
 
-    if (
-      (fileCounts[pawn.file - 1] ?? 0) === 0 &&
-      (fileCounts[pawn.file + 1] ?? 0) === 0
-    ) {
+    if ((fileCounts[pawn.file - 1] ?? 0) === 0 && (fileCounts[pawn.file + 1] ?? 0) === 0) {
       score -= 10;
     }
 
@@ -601,17 +521,99 @@ function isPassedPawn(pawn: PawnInfo, pawns: PawnInfo[]): boolean {
   const enemyColor = oppositeColor(pawn.color);
 
   return !pawns.some((candidate) => {
-    if (
-      candidate.color !== enemyColor ||
-      Math.abs(candidate.file - pawn.file) > 1
-    ) {
+    if (candidate.color !== enemyColor || Math.abs(candidate.file - pawn.file) > 1) {
       return false;
     }
 
-    return pawn.color === 'w'
-      ? candidate.rank > pawn.rank
-      : candidate.rank < pawn.rank;
+    return pawn.color === 'w' ? candidate.rank > pawn.rank : candidate.rank < pawn.rank;
   });
+}
+
+function openingPhaseWeight(nonPawnMaterial: number): number {
+  return clamp(
+    (nonPawnMaterial - OPENING_PHASE_END_MATERIAL) /
+      (STARTING_NON_PAWN_MATERIAL - OPENING_PHASE_END_MATERIAL),
+    0,
+    1,
+  );
+}
+
+function openingPrinciplesScore(
+  board: ReturnType<Chess['board']>,
+  pawns: PawnInfo[],
+  color: Color,
+  nonPawnMaterial: number,
+): number {
+  const phase = openingPhaseWeight(nonPawnMaterial);
+
+  if (phase <= 0) {
+    return 0;
+  }
+
+  let score = centralLineOpeningScore(board, color);
+  let developedCenterPawns = 0;
+
+  for (const pawn of pawns) {
+    if (pawn.color !== color) {
+      continue;
+    }
+
+    const relativeRank = color === 'w' ? pawn.rank : 9 - pawn.rank;
+
+    if (pawn.file === 3 || pawn.file === 4) {
+      if (relativeRank === 4 || relativeRank === 5) {
+        score += 76;
+      } else if (relativeRank === 3) {
+        score += 30;
+      }
+
+      if (relativeRank >= 3) {
+        developedCenterPawns += 1;
+      }
+    } else if (pawn.file === 2 || pawn.file === 5) {
+      if (relativeRank === 4 || relativeRank === 5) {
+        score += 18;
+      } else if (relativeRank === 3) {
+        score += 6;
+      }
+    }
+  }
+
+  if (developedCenterPawns >= 2) {
+    score += 16;
+  }
+
+  return Math.round(score * phase);
+}
+
+function centralLineOpeningScore(board: ReturnType<Chess['board']>, color: Color): number {
+  let score = 0;
+
+  if (!hasPawnOnSquare(board, color, color === 'w' ? 'd2' : 'd7')) {
+    score += 10;
+  }
+
+  if (!hasPawnOnSquare(board, color, color === 'w' ? 'e2' : 'e7')) {
+    score += 12;
+  }
+
+  return score;
+}
+
+function hasPawnOnSquare(
+  board: ReturnType<Chess['board']>,
+  color: Color,
+  square: Square,
+): boolean {
+  for (const row of board) {
+    for (const piece of row) {
+      if (piece?.color === color && piece.type === 'p' && piece.square === square) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 function developmentScore(board: ReturnType<Chess['board']>, color: Color): number {
@@ -648,9 +650,8 @@ function developmentScore(board: ReturnType<Chess['board']>, color: Color): numb
 }
 
 function hasMovedMinorPieces(board: ReturnType<Chess['board']>, color: Color): boolean {
-  const homeSquares = color === 'w'
-    ? new Set(['b1', 'c1', 'f1', 'g1'])
-    : new Set(['b8', 'c8', 'f8', 'g8']);
+  const homeSquares =
+    color === 'w' ? new Set(['b1', 'c1', 'f1', 'g1']) : new Set(['b8', 'c8', 'f8', 'g8']);
 
   for (const row of board) {
     for (const piece of row) {
@@ -689,14 +690,45 @@ function kingSafetyScore(
     }
 
     const hasShieldPawn = pawns.some(
-      (pawn) =>
-        pawn.color === color && pawn.file === file && pawn.rank === shieldRank,
+      (pawn) => pawn.color === color && pawn.file === file && pawn.rank === shieldRank,
     );
 
-    score += hasShieldPawn ? 14 : -10;
+    if (hasShieldPawn) {
+      score += 14;
+      continue;
+    }
+
+    score += openingCentralShieldScore(kingSquare, pawns, color, file, nonPawnMaterial) ?? -10;
   }
 
   return score;
+}
+
+function openingCentralShieldScore(
+  kingSquare: Square,
+  pawns: PawnInfo[],
+  color: Color,
+  file: number,
+  nonPawnMaterial: number,
+): number | null {
+  const homeKingSquare = color === 'w' ? 'e1' : 'e8';
+  const phase = openingPhaseWeight(nonPawnMaterial);
+
+  if (kingSquare !== homeKingSquare || phase <= 0 || (file !== 3 && file !== 4)) {
+    return null;
+  }
+
+  const hasAdvancedCenterPawn = pawns.some((pawn) => {
+    if (pawn.color !== color || pawn.file !== file) {
+      return false;
+    }
+
+    const relativeRank = color === 'w' ? pawn.rank : 9 - pawn.rank;
+
+    return relativeRank === 3 || relativeRank === 4;
+  });
+
+  return hasAdvancedCenterPawn ? Math.round(-10 + 24 * phase) : null;
 }
 
 function terminalScore(chess: Chess, ply: number): number {
@@ -714,8 +746,7 @@ function terminalScore(chess: Chess, ply: number): number {
 function orderMoves(moves: Move[], preferredMove: AiMoveCommand | null): Move[] {
   return [...moves].sort(
     (left, right) =>
-      moveOrderingScore(right, preferredMove) -
-      moveOrderingScore(left, preferredMove),
+      moveOrderingScore(right, preferredMove) - moveOrderingScore(left, preferredMove),
   );
 }
 
@@ -803,12 +834,7 @@ function publishSearchProgress(
 }
 
 function isTacticalMove(move: Move): boolean {
-  return (
-    move.isCapture() ||
-    move.isPromotion() ||
-    move.san.includes('+') ||
-    move.san.includes('#')
-  );
+  return move.isCapture() || move.isPromotion() || move.san.includes('+') || move.san.includes('#');
 }
 
 function selectRootMove(
@@ -819,46 +845,28 @@ function selectRootMove(
   const level = settings.randomness / MAX_RANDOMNESS;
   const windowCp = RANDOM_WINDOW_BASE_CP + RANDOM_WINDOW_RANGE_CP * level;
   const floorScore = best.score - windowCp;
-  const ticketPower =
-    RANDOM_TICKET_POWER_MAX - RANDOM_TICKET_POWER_RANGE * level;
+  const ticketPower = RANDOM_TICKET_POWER_MAX - RANDOM_TICKET_POWER_RANGE * level;
 
   if (shouldForceBestMove(settings, best)) {
     return {
       selected: best,
-      debug: createDeterministicDebug(
-        candidates,
-        best,
-        best,
-        windowCp,
-        floorScore,
-        ticketPower,
-      ),
+      debug: createDeterministicDebug(candidates, best, best, windowCp, floorScore, ticketPower),
     };
   }
 
-  const weightedCandidates = candidates
+  const ticketCandidates = selectTicketCandidates(candidates, settings, best);
+  const weightedCandidates = ticketCandidates
     .map((candidate) => ({
       candidate,
-      tickets:
-        (Math.max(0, candidate.score - floorScore) / windowCp) ** ticketPower,
+      tickets: (Math.max(0, candidate.score - floorScore) / windowCp) ** ticketPower,
     }))
     .filter(({ tickets }) => tickets > 0);
-  const totalTickets = weightedCandidates.reduce(
-    (total, { tickets }) => total + tickets,
-    0,
-  );
+  const totalTickets = weightedCandidates.reduce((total, { tickets }) => total + tickets, 0);
 
   if (totalTickets <= 0) {
     return {
       selected: best,
-      debug: createDeterministicDebug(
-        candidates,
-        best,
-        best,
-        windowCp,
-        floorScore,
-        ticketPower,
-      ),
+      debug: createDeterministicDebug(candidates, best, best, windowCp, floorScore, ticketPower),
     };
   }
 
@@ -889,15 +897,24 @@ function selectRootMove(
   };
 }
 
-function shouldForceBestMove(
-  settings: AiSettings,
-  best: SearchResult,
-): boolean {
+function shouldForceBestMove(settings: AiSettings, best: SearchResult): boolean {
   return (
     settings.randomness === 0 ||
     isMateProtectedScore(best.score) ||
     (settings.preset === 'hard' && best.score < 0)
   );
+}
+
+function selectTicketCandidates(
+  candidates: RootCandidate[],
+  settings: AiSettings,
+  best: SearchResult,
+): RootCandidate[] {
+  if (settings.preset === 'hard' && best.score > 0) {
+    return candidates.filter((candidate) => candidate.score > 0);
+  }
+
+  return candidates;
 }
 
 function selectBestRootMove(candidates: RootCandidate[]): SearchResult {
@@ -995,10 +1012,7 @@ function isSameMove(move: Move, command: AiMoveCommand): boolean {
   );
 }
 
-function isSameMoveCommand(
-  left: AiMoveCommand,
-  right: AiMoveCommand,
-): boolean {
+function isSameMoveCommand(left: AiMoveCommand, right: AiMoveCommand): boolean {
   return (
     left.from === right.from &&
     left.to === right.to &&
@@ -1018,8 +1032,12 @@ function oppositeColor(color: Color): Color {
   return color === 'w' ? 'b' : 'w';
 }
 
-function clampDepth(depth: number): AiDepth {
-  return clamp(Math.round(depth), 1, 5) as AiDepth;
+function normalizeMaxDepth(depth: number, preset: AiPreset): number {
+  if (preset === 'hard') {
+    return HARD_MAX_DEPTH;
+  }
+
+  return clamp(Math.round(depth), 1, 5);
 }
 
 function clamp(value: number, min: number, max: number): number {
