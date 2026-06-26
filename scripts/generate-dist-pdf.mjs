@@ -1876,7 +1876,7 @@ async function generateDistDiffReport(options) {
 }
 
 async function generateCurrentDistReport() {
-  const { textFiles } = await collectDistTextFiles(DIST_DIR, { writeFormatted: true });
+  const { textFiles } = await collectDistTextFiles(DIST_DIR, { writeFormatted: false });
 
   if (textFiles.length === 0) {
     throw new Error('No UTF-8 text files found under dist.');

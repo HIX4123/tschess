@@ -1,46 +1,163 @@
-# TypeScript + SCSS Template (Vite)
+# TS Chess
 
-Vite 기반 `TypeScript + SCSS` 보일러플레이트 템플릿입니다.
+에어갭 환경에서 동작하는 브라우저 체스 앱입니다. Vite + Vanilla TypeScript + SCSS로 구현되었으며, 외부 네트워크나 서버 없이 `dist/index.html` 단일 파일만으로 실행됩니다.
 
-## Scripts
+## 기능
 
-- `npm run dev`: 개발 서버 실행
-- `npm run build`: 타입 체크 후 프로덕션 빌드
-- `npm run build:pdf`: 빌드 후 `dist` 텍스트 파일 PDF 리포트 생성
-- `npm run preview`: 빌드 결과 미리보기
-- `npm run lint`: ESLint 실행
-- `npm run format`: Prettier 포맷팅
-- `npm run rg -- <pattern>`: ripgrep 검색 (`예: npm run rg -- "TODO" src`)
+### 게임 모드
+- **로컬 2인**: 한 화면에서 두 플레이어가 번갈아 두는 모드. 매 수 이후 다음 차례 플레이어가 화면 아래쪽에 오도록 보드와 타이머가 자동으로 뒤집힘
+- **AI 상대**: 플레이어가 진영(백/흑)을 선택하고 AI와 대국. AI는 Web Worker에서 비동기로 실행됨
 
-## Dist PDF Report
+### 체스 룰
+chess.js 기반 core-only 로컬 포크(`src/chess/chess-core.ts`)가 룰 엔진을 담당합니다. PGN 파싱/내보내기 등 앱에 불필요한 기능을 제거한 경량 버전으로, BSD-2-Clause 라이선스 고지를 유지합니다.
+
+지원 규칙: 캐슬링, 앙파상, 폰 승격, 체크/체크메이트, 스테일메이트, 기물 부족 무승부, 50수 규칙, 3회 반복 무승부
+
+### 체스 클락
+시간제 대국을 지원합니다. 프리셋은 분/초 증가분 기준입니다.
+
+| 프리셋 | 기본 시간 | 수당 증가 |
+|--------|-----------|-----------|
+| 1/1    | 1분       | 1초       |
+| 3/2    | 3분       | 2초       |
+| 5/3    | 5분       | 3초       |
+| 10/5 (기본) | 10분 | 5초      |
+| 15/10  | 15분      | 10초      |
+
+- 시간이 30초 이하이면 경고, 10초 이하이면 위험 색상으로 강조
+- AI 모드에서는 AI 계산 시간도 AI 진영 시계에서 차감
+- 보드 방향에 맞춰 현재 차례 플레이어의 시계가 아래쪽에 표시
+
+### AI 엔진
+
+`src/chess/ai.ts` + `src/chess/ai.worker.ts`에 구현된 순수 TypeScript 체스 엔진입니다. 외부 바이너리, WASM, Stockfish 없이 동작합니다.
+
+**탐색 알고리즘**
+- 반복 심화(Iterative Deepening) + Negamax + 알파-베타 가지치기
+- 정적 교환 평가 없는 퀴에센스 탐색(최대 6 플라이): 체크, 기물 포획, 승격 후속 수 분석
+- 이전 깊이의 최선 수 우선 탐색으로 알파-베타 효율 개선
+- 어려움 모드에서 연속 두 깊이에 최선 수와 점수가 안정되면 조기 종료
+
+**평가 함수** (센티폰 단위)
+- 기물 가치: 폰 100, 나이트 320, 비숍 330, 룩 500, 퀸 900
+- 기물-위치 테이블(Piece-Square Table): 기물 종류별 위치 보정
+- 쌍 비숍 보너스 +35
+- 폰 구조: 이중 폰 -14, 고립 폰 -10, 통과 폰 제곱 가중 보너스
+- 오프닝 원칙: 중앙 폰 전진, 기물 개발, 퀸 조기 출동 페널티 (비폰 기물 수에 따라 페이드아웃)
+- 킹 안전: 킹사이드/퀸사이드 캐슬 위치 선호, 폰 방패 평가 (엔드게임에서 감소)
+- 기동성: 합법적인 수 수에 비례한 보너스
+- 체크 페널티 -45
+
+**이동 순서 우선순위**
+1. 이전 깊이 최선 수
+2. 체크메이트 수
+3. MVV-LVA (Most Valuable Victim – Least Valuable Aggressor) 포획
+4. 승격
+5. 캐슬링
+6. 기물-위치 테이블 보정
+
+**다양성 시스템 (가중 추첨)**
+
+AI 난이도 프리셋의 `randomness` 값에 따라 최선 수 근처 후보군에서 가중 추첨으로 수를 선택합니다. 순수 랜덤이 아니라 센티폰 점수 기반 티켓 분배(`(score - floor) / window)^power` 지수 승)를 사용해, 최선 수에 가까울수록 훨씬 높은 확률로 선택됩니다.
+
+- 메이트 보호 점수 이상인 경우와 어려움 모드에서 열세일 경우에는 항상 최선 수 선택
+- 어려움 모드에서 이기고 있을 때는 양수 점수 후보만 추첨 대상
+
+**AI 프리셋**
+
+| 프리셋 | 최대 깊이 | 시간 제한 |
+|--------|-----------|-----------|
+| 쉬움   | 2         | 0.75초    |
+| 보통 (기본) | 5    | 5초       |
+| 어려움 | 무제한    | 자동 (남은 시간 기반) |
+
+어려움 모드는 `잔여시간 / 30 + 증가분 × 0.8` 공식으로 수당 사용 시간을 자동 산출합니다.
+
+**오프닝 프리셋**
+
+AI가 흑을 쥐고 첫 수를 둘 때, Lichess cloud eval 기반 Stockfish 센티폰 가중치로 백의 오프닝을 선택합니다 (e4, d4, Nf3, c4, g3, b3).
+
+### UI 레이아웃 (데스크톱 기준)
+
+```
+[좌: 컨트롤 패널] [중: 체스판] [중-우: 타이머] [우: 상태/AI 정보/기보]
+```
+
+- 모드, 진영, AI 설정, 시간 설정, 새 게임/되돌리기 → 좌측 패널
+- 체스판 → 중앙, 화면 높이에 맞게 최대화
+- 타이머 → 보드 바로 옆, 현재 보드 방향에 맞춰 위아래 배치
+- 게임 상태, AI 디버그 정보, 기보 → 우측 패널 (내부 스크롤)
+
+AI 모드에서는 AI 정보 패널이 표시되며, 탐색 깊이/노드 수/평가 점수와 함께 각 후보 수의 SAN, 센티폰, 가중치, 채택 확률을 실시간으로 확인할 수 있습니다.
+
+## 빌드 및 실행
+
+```bash
+npm install
+
+# 개발 서버
+npm run dev
+
+# 프로덕션 빌드 (dist/ 생성)
+npm run build
+
+# 빌드 + PDF 리포트 생성 (artifacts/build-report.pdf)
+npm run build:pdf
+
+# 빌드 결과 미리보기
+npm run preview
+```
+
+### 에어갭 배포
+
+`npm run build` 후 `dist/` 디렉터리를 그대로 복사하면 됩니다. `dist/index.html`을 브라우저에서 직접 열어도 동작합니다 (`file://` 프로토콜 지원).
+
+체스 룰 엔진과 AI 엔진 소스가 `index.html` 내부의 `<script type="text/plain">` 블록에 인라인되어 있으며, Web Worker는 이 소스를 Blob URL로 인스턴스화하므로 별도 파일 서빙이 불필요합니다.
+
+## 기타 스크립트
+
+| 명령 | 설명 |
+|------|------|
+| `npm run typecheck` | TypeScript 타입 검사 (app / node / test 세 tsconfig) |
+| `npm run lint` | ESLint 실행 |
+| `npm run format` | Prettier 포맷팅 |
+| `npm run verify:colors` | oklch 색상 값 검증 |
+| `npm run rg -- <pattern>` | ripgrep 검색 (`예: npm run rg -- "TODO" src`) |
+| `npm run build:pdf:diff` | 이전 빌드와의 diff PDF 생성 |
+
+## PDF 빌드 리포트
 
 `npm run build:pdf`를 실행하면 아래 작업이 순서대로 수행됩니다.
 
 1. `npm run build`
-2. `dist` 하위 UTF-8 텍스트 파일을 Prettier 기본값으로 포맷(실제 파일 수정)
-3. 단일 PDF 리포트 생성
-
-출력 파일:
-
-- `artifacts/build-report.pdf`
+2. `dist` 하위 UTF-8 텍스트 파일을 Prettier 기본값으로 포맷 (실제 파일 수정)
+3. 단일 PDF 리포트 생성 → `artifacts/build-report.pdf`
 
 PDF 구성:
-
-- `File Tree` 소제목 + `dist/` 파일 트리
-- 파일 트리에 `(용량 / 해시)` 형식으로 `(<size> B / <sha12>)` 표시
-- 파일 구분 헤더(`==== path (<size> B / <sha12>) ====`) 기반 연속 본문 출력
-- 코드 라인 번호/전체 공백 가시화(`·`) + 들여쓰기 단위 경계 표시 + 탭 기호화(`→`)
-- 흑백(회색조) 문법 하이라이트 + 괄호쌍 깊이 강조
-
-참고:
-
-- UTF-8이 아닌 파일은 콘솔에 `[skip]` 로그를 남기고 제외됩니다.
-- Prettier parser를 찾지 못한 파일은 `[format-skip]` 경고 후 원문으로 계속 진행합니다.
-- 텍스트 파일이 하나도 없으면 스크립트는 실패 코드로 종료됩니다.
-- 기본 출력 폰트는 `assets/fonts/D2CodingLigature-*.ttf`를 사용하며, 로드 실패 시 ASCII 심볼로 폴백합니다.
-- `sha12`는 선행 들여쓰기를 4칸 기준으로 정규화한 텍스트의 SHA-256 해시 앞 12자리입니다.
-- `build:pdf` 포맷 단계는 VSCode 사용자 로컬 설정을 읽지 않고 레포의 `.prettierrc` 설정을 사용합니다.
+- `File Tree` 소제목 + `dist/` 파일 트리 (용량 / sha12 표시)
+- 파일 구분 헤더 기반 연속 본문 출력
+- 코드 라인 번호 / 공백 가시화(`·`) / 들여쓰기 단위 경계 표시 / 탭 기호화(`→`)
+- 흑백(회색조) 문법 하이라이트 + 괄호 쌍 깊이 강조
+- 기본 폰트: `assets/fonts/D2CodingLigature-*.ttf` (로드 실패 시 ASCII 폴백)
 
 에어갭 검증:
+- `sha12`는 들여쓰기를 4칸 기준으로 정규화한 텍스트의 SHA-256 해시 앞 12자리로, 단순 `sha256sum`/`certutil` 결과와 다를 수 있습니다.
 
-- `sha12`는 들여쓰기 정규화가 포함되어 단순 `sha256sum`/`certutil` 결과와 다를 수 있습니다.
+## 소스 구조
+
+```
+src/
+  chess/
+    app.ts              # UI 및 게임 상태 관리
+    ai.ts               # AI 탐색 엔진 (negamax, 평가 함수, 다양성 시스템)
+    ai.worker.ts        # Web Worker 진입점
+    chess-core.ts       # chess.js core-only 로컬 포크 (BSD-2-Clause)
+    chess-runtime.ts    # 런타임 타입 re-export
+    chess-runtime.global.ts  # 에어갭 빌드용 전역 공유 런타임
+  styles/
+    main.scss           # 전체 레이아웃 및 컴포넌트 스타일
+    variables.scss      # 디자인 토큰 (oklch 색상)
+    mixins.scss         # 공통 믹스인
+    reset.scss          # CSS 리셋
+  main.ts               # 진입점
+```

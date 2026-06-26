@@ -17,6 +17,20 @@ const SHARED_CORE_SOURCE_ID = 'ts-chess-shared-core-source';
 const WORKER_SOURCE_ID_PREFIX = 'ai-worker-source';
 const CORE_BUNDLE_MARKERS = ['class Chess', 'MASK64'];
 const ROOT_ASSET_NAMES = new Set(['main.js', 'style.css']);
+const SHARED_CORE_TERSER_OPTIONS = {
+  compress: {
+    passes: 3,
+    drop_console: true,
+    drop_debugger: true,
+    pure_funcs: ['console.log', 'console.info', 'console.debug'],
+  },
+  mangle: false,
+  keep_fnames: true,
+  keep_classnames: true,
+  format: {
+    comments: false,
+  },
+};
 
 const SCRIPT_TAG_PATTERN = /<script\b([^>]*)><\/script>/giu;
 const LINK_TAG_PATTERN = /<link\b([^>]*)>/giu;
@@ -259,7 +273,8 @@ async function buildSharedCoreContent() {
       write: false,
       emptyOutDir: false,
       target: 'es2022',
-      minify: false,
+      minify: 'terser',
+      terserOptions: SHARED_CORE_TERSER_OPTIONS,
       sourcemap: false,
       reportCompressedSize: false,
       lib: {
