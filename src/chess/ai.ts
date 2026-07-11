@@ -137,6 +137,9 @@ const RANDOM_TICKET_POWER_RANGE = 1.5;
 const MATE_RANDOM_PROTECTION_SCORE = MATE_SCORE - 10_000;
 const STABLE_DEPTH_SCORE_SWING_CP = 90;
 const STABLE_DEPTH_CLEAR_GAP_CP = 120;
+const STABLE_DEPTH_REQUIRED = 2;
+const STABLE_DEPTH_MIN_DEPTH = 4;
+const QUIET_SWING_CP = 50;
 const STARTING_NON_PAWN_MATERIAL =
   2 * (PIECE_VALUES.q + 2 * PIECE_VALUES.r + 2 * PIECE_VALUES.b + 2 * PIECE_VALUES.n);
 const OPENING_PHASE_END_MATERIAL = STARTING_NON_PAWN_MATERIAL / 2;
@@ -180,6 +183,8 @@ export function searchBestMove(
   let previousBestMove: AiMoveCommand | null = null;
   let previousPrincipal: SearchResult | null = null;
   let depthReached = 0;
+  let stableDepthCount = 0;
+  const rootStaticScore = evaluatePosition(chess);
 
   for (let depth = 1; depth <= settings.maxDepth; depth += 1) {
     try {
@@ -200,7 +205,15 @@ export function searchBestMove(
         elapsedMs,
       );
 
-      if (shouldStopAfterStableDepth(result, previousPrincipal, settings)) {
+      const stable =
+        previousPrincipal !== null &&
+        isSameMoveCommand(previousPrincipal.move, result.principal.move) &&
+        Math.abs(previousPrincipal.score - result.principal.score) <=
+          STABLE_DEPTH_SCORE_SWING_CP;
+
+      stableDepthCount = stable ? stableDepthCount + 1 : 0;
+
+      if (shouldStopEarly(result, depth, stableDepthCount, rootStaticScore, settings)) {
         break;
       }
 
@@ -277,26 +290,34 @@ function searchRoot(
   };
 }
 
-function shouldStopAfterStableDepth(
+function shouldStopEarly(
   result: RootSearchResult,
-  previousPrincipal: SearchResult | null,
+  depth: number,
+  stableDepthCount: number,
+  rootStaticScore: number,
   settings: AiSettings,
 ): boolean {
-  if (settings.preset !== 'hard' || previousPrincipal === null) {
-    return false;
-  }
-
-  if (!isSameMoveCommand(previousPrincipal.move, result.principal.move)) {
-    return false;
-  }
-
   if (
-    Math.abs(previousPrincipal.score - result.principal.score) > STABLE_DEPTH_SCORE_SWING_CP
+    settings.preset !== 'hard' ||
+    depth < STABLE_DEPTH_MIN_DEPTH ||
+    stableDepthCount < 1
   ) {
     return false;
   }
 
-  return rootScoreGap(result.debug) >= STABLE_DEPTH_CLEAR_GAP_CP;
+  // The best move clearly dominates the field, so confirming it deeper adds little.
+  if (rootScoreGap(result.debug) >= STABLE_DEPTH_CLEAR_GAP_CP) {
+    return true;
+  }
+
+  // Quiet position: playing the best move barely shifts the evaluation from before
+  // moving, so there is little to gain from calculating longer.
+  if (Math.abs(result.principal.score - rootStaticScore) <= QUIET_SWING_CP) {
+    return true;
+  }
+
+  // The best move and its score have held steady across several consecutive depths.
+  return stableDepthCount >= STABLE_DEPTH_REQUIRED;
 }
 
 function rootScoreGap(debug: AiDebugInfo): number {

@@ -24,8 +24,6 @@ const DIST_DIR = path.resolve(PROJECT_ROOT, 'dist');
 const ARTIFACTS_DIR = path.resolve(PROJECT_ROOT, 'artifacts');
 const OUTPUT_FILE = path.resolve(ARTIFACTS_DIR, 'build-report.pdf');
 const NODE_MODULES_DIR = path.resolve(PROJECT_ROOT, 'node_modules');
-const MAIN_BUNDLE_FILE = 'main.js';
-const STYLE_BUNDLE_FILE = 'style.css';
 const FONT_REGULAR_PATH = path.resolve(
   PROJECT_ROOT,
   'assets',
@@ -617,23 +615,37 @@ async function collectDistSnapshot(distDir, label) {
   };
 }
 
-function isSamePath(left, right) {
-  return path.resolve(left) === path.resolve(right);
+function ensureRelativeAssetReference(relativePath) {
+  return relativePath.startsWith('.') ? relativePath : `./${relativePath}`;
 }
 
-function assetReferenceVariants(relativePath) {
-  return [relativePath, `./${relativePath}`, `/${relativePath}`];
+function assetReferenceMappings(fromRelativePath, move) {
+  const fromDirectory = path.posix.dirname(fromRelativePath);
+  const oldLocalReference = path.posix.relative(fromDirectory, move.oldRelativePath);
+  const newLocalReference = path.posix.relative(fromDirectory, move.newRelativePath);
+  const mappings = new Map([
+    [`/${move.oldRelativePath}`, `/${move.newRelativePath}`],
+    [
+      ensureRelativeAssetReference(oldLocalReference),
+      ensureRelativeAssetReference(newLocalReference),
+    ],
+    [oldLocalReference, newLocalReference],
+  ]);
+
+  return [...mappings].sort(([left], [right]) => right.length - left.length);
 }
 
-function replaceAssetReferences(content, oldRelativePath, newRelativePath) {
-  if (oldRelativePath === newRelativePath) {
+function replaceAssetReferences(content, fromRelativePath, move) {
+  if (move.oldRelativePath === move.newRelativePath) {
     return content;
   }
 
   let output = content;
-  for (const oldReference of assetReferenceVariants(oldRelativePath)) {
-    output = output.replaceAll(oldReference, `./${newRelativePath}`);
+
+  for (const [oldReference, newReference] of assetReferenceMappings(fromRelativePath, move)) {
+    output = output.replaceAll(oldReference, newReference);
   }
+
   return output;
 }
 
@@ -671,30 +683,34 @@ function extractAttributeReferences(html, tagName, attributeName) {
   return references;
 }
 
-function findReferencedBundle(html, extension, references) {
-  const bundleReferences = references
-    .map((reference) => normalizeDistAssetReference(reference))
-    .filter((reference) => reference && path.extname(reference).toLowerCase() === extension);
+function collectReferencedBundles(html) {
+  const references = [
+    ...extractAttributeReferences(html, 'script', 'src'),
+    ...extractAttributeReferences(html, 'link', 'href'),
+  ];
 
-  if (bundleReferences.length !== 1) {
-    throw new Error(
-      `Expected one referenced ${extension} bundle, found: ${bundleReferences.join(', ') || '<none>'}`,
-    );
-  }
-
-  return bundleReferences[0];
+  return [
+    ...new Set(
+      references
+        .map((reference) => normalizeDistAssetReference(reference))
+        .filter(
+          (reference) =>
+            reference && ['.js', '.css'].includes(path.extname(reference).toLowerCase()),
+        ),
+    ),
+  ];
 }
 
-async function moveBundleFile(distDir, sourceRelativePath, targetFileName) {
+async function moveBundleFile(distDir, sourceRelativePath, targetRelativePath) {
   const sourceFile = path.join(distDir, sourceRelativePath);
-  const targetFile = path.join(distDir, targetFileName);
+  const targetFile = path.join(distDir, targetRelativePath);
   const oldRelativePath = distRelativePath(distDir, sourceFile);
 
-  if (!isSamePath(sourceFile, targetFile)) {
+  if (sourceRelativePath !== targetRelativePath) {
     try {
       accessSync(targetFile);
       throw new Error(
-        `Cannot canonicalize ${oldRelativePath}; ${targetFileName} already exists in dist.`,
+        `Cannot canonicalize ${oldRelativePath}; ${targetRelativePath} already exists in dist.`,
       );
     } catch (error) {
       if (error?.code !== 'ENOENT') {
@@ -707,7 +723,7 @@ async function moveBundleFile(distDir, sourceRelativePath, targetFileName) {
 
   return {
     oldRelativePath,
-    newRelativePath: targetFileName,
+    newRelativePath: targetRelativePath,
   };
 }
 
@@ -717,29 +733,50 @@ function removeViteHash(fileName) {
   return `${baseName.replace(/-[A-Za-z0-9_-]{8}$/u, '')}${extension}`;
 }
 
-async function moveExtraBundleFiles(distDir, extension, reservedNames) {
+function appendCollisionSuffix(relativePath, suffix) {
+  const extension = path.posix.extname(relativePath);
+  return `${relativePath.slice(0, -extension.length)}-${suffix}${extension}`;
+}
+
+async function createCanonicalBundleMoves(distDir) {
   const files = await listFilesRecursively(distDir);
   const bundleFiles = files
-    .filter((filePath) => path.extname(filePath).toLowerCase() === extension)
+    .filter((filePath) => ['.js', '.css'].includes(path.extname(filePath).toLowerCase()))
     .sort((a, b) => distRelativePath(distDir, a).localeCompare(distRelativePath(distDir, b)));
+  const occupiedPaths = new Set(files.map((filePath) => distRelativePath(distDir, filePath)));
   const moves = [];
-  const usedNames = new Set(reservedNames);
 
-  for (const [index, filePath] of bundleFiles.entries()) {
+  for (const filePath of bundleFiles) {
     const oldRelativePath = distRelativePath(distDir, filePath);
-    if (reservedNames.has(path.basename(oldRelativePath))) {
+    const stableBaseName = removeViteHash(path.posix.basename(oldRelativePath));
+    const stableRelativePath = path.posix.join(path.posix.dirname(oldRelativePath), stableBaseName);
+    if (stableRelativePath === oldRelativePath) {
       continue;
     }
 
-    const stableName = removeViteHash(path.basename(oldRelativePath));
-    const targetFileName = usedNames.has(stableName)
-      ? `chunk-${index + 1}${extension}`
-      : stableName;
-    usedNames.add(targetFileName);
-    moves.push(await moveBundleFile(distDir, oldRelativePath, targetFileName));
+    let newRelativePath = stableRelativePath;
+    let collisionIndex = 2;
+    while (occupiedPaths.has(newRelativePath)) {
+      newRelativePath = appendCollisionSuffix(stableRelativePath, collisionIndex);
+      collisionIndex += 1;
+    }
+
+    occupiedPaths.add(newRelativePath);
+    moves.push({ oldRelativePath, newRelativePath });
   }
 
   return moves;
+}
+
+async function assertReferencedBundlesExist(distDir, html) {
+  const references = collectReferencedBundles(html);
+  if (references.length === 0) {
+    throw new Error('Expected at least one referenced JS or CSS bundle in dist/index.html.');
+  }
+
+  for (const reference of references) {
+    accessSync(path.join(distDir, reference));
+  }
 }
 
 async function rewriteMovedAssetReferences(distDir, moves) {
@@ -753,11 +790,12 @@ async function rewriteMovedAssetReferences(distDir, moves) {
   );
 
   for (const filePath of textFiles) {
-    let content = await readFile(filePath, 'utf8');
+    const relativePath = distRelativePath(distDir, filePath);
+    const content = await readFile(filePath, 'utf8');
     let nextContent = content;
 
     for (const move of moves) {
-      nextContent = replaceAssetReferences(nextContent, move.oldRelativePath, move.newRelativePath);
+      nextContent = replaceAssetReferences(nextContent, relativePath, move);
     }
 
     if (nextContent !== content) {
@@ -769,23 +807,16 @@ async function rewriteMovedAssetReferences(distDir, moves) {
 async function canonicalizeDistBundleNames(distDir) {
   const htmlFile = path.join(distDir, 'index.html');
   const html = await readFile(htmlFile, 'utf8');
-  const scriptReference = findReferencedBundle(
-    html,
-    '.js',
-    extractAttributeReferences(html, 'script', 'src'),
-  );
-  const stylesheetReference = findReferencedBundle(
-    html,
-    '.css',
-    extractAttributeReferences(html, 'link', 'href'),
-  );
-  const moves = [
-    await moveBundleFile(distDir, scriptReference, MAIN_BUNDLE_FILE),
-    await moveBundleFile(distDir, stylesheetReference, STYLE_BUNDLE_FILE),
-    ...(await moveExtraBundleFiles(distDir, '.js', new Set([MAIN_BUNDLE_FILE, STYLE_BUNDLE_FILE]))),
-  ];
+  await assertReferencedBundlesExist(distDir, html);
+
+  const plannedMoves = await createCanonicalBundleMoves(distDir);
+  const moves = [];
+  for (const move of plannedMoves) {
+    moves.push(await moveBundleFile(distDir, move.oldRelativePath, move.newRelativePath));
+  }
 
   await rewriteMovedAssetReferences(distDir, moves);
+  await assertReferencedBundlesExist(distDir, await readFile(htmlFile, 'utf8'));
 }
 
 function extractScopes(token) {

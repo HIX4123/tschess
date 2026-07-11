@@ -43,19 +43,23 @@ const WHITE_RANKS = [8, 7, 6, 5, 4, 3, 2, 1] as const;
 const BLACK_RANKS = [...WHITE_RANKS].reverse();
 const PROMOTION_PIECES: PromotionPiece[] = ['q', 'r', 'b', 'n'];
 const AI_DELAY_MS = 180;
+const OPENING_FULL_PLY = 20;
+const OPENING_MIN_FACTOR = 0.2;
 const CLOCK_TICK_MS = 100;
 const DEFAULT_CLOCK_PRESET: ClockPreset = '10/5';
 const DEBUG_MATE_SCORE_THRESHOLD = 900_000;
 const TEXT_SEPARATOR = ' \u00B7 ';
 const SQUARE_SET = new Set<string>(SQUARES);
-// Weights are Stockfish cp values from Lichess cloud eval for the standard start position.
+// Weights are Stockfish cp values (depth 30) for White's first move from the standard
+// start position. Moves evaluating at cp <= 0 are omitted from the pool.
 const AI_WHITE_OPENING_PRESET: WeightedOpeningMove[] = [
-  { from: 'e2', to: 'e4', weight: 28 },
-  { from: 'd2', to: 'd4', weight: 25 },
-  { from: 'g1', to: 'f3', weight: 24 },
-  { from: 'c2', to: 'c4', weight: 20 },
-  { from: 'g2', to: 'g3', weight: 9 },
-  { from: 'b2', to: 'b3', weight: 6 },
+  { from: 'e2', to: 'e4', weight: 29 },
+  { from: 'd2', to: 'd4', weight: 29 },
+  { from: 'g1', to: 'f3', weight: 28 },
+  { from: 'c2', to: 'c4', weight: 22 },
+  { from: 'g2', to: 'g3', weight: 22 },
+  { from: 'e2', to: 'e3', weight: 12 },
+  { from: 'c2', to: 'c3', weight: 7 },
 ];
 const CLOCK_PRESETS: Record<ClockPreset, ClockConfig> = {
   '1/1': { baseMs: 60_000, incrementMs: 1_000 },
@@ -128,6 +132,7 @@ export function createChessApp(): void {
   let mode: GameMode = 'local';
   let clockPreset: ClockPreset = DEFAULT_CLOCK_PRESET;
   let clockMs: Record<Color, number> = createClockState(clockPreset);
+  let clockHistory: Record<Color, number>[] = [];
   let activeClockColor: Color | null = null;
   let lastClockTick = Date.now();
   let clockTimerId: number | null = null;
@@ -318,19 +323,21 @@ export function createChessApp(): void {
       return;
     }
 
-    if (mode === 'ai') {
-      if (game.turn() === humanColor) {
-        game.undo();
-        game.undo();
-      } else {
-        game.undo();
-      }
-    } else {
+    const desiredUndoCount = mode === 'ai' ? (game.turn() === humanColor ? 2 : 1) : 1;
+    const undoCount = Math.min(desiredUndoCount, game.history().length);
+    let restoredClockMs: Record<Color, number> | undefined;
+
+    for (let i = 0; i < undoCount; i += 1) {
       game.undo();
+      restoredClockMs = clockHistory.pop() ?? restoredClockMs;
     }
 
+    if (restoredClockMs) {
+      clockMs = restoredClockMs;
+    }
+
+    timedOutColor = null;
     clearSelection();
-    resetClockState();
     restartClockForCurrentTurn();
     render();
   }
@@ -473,6 +480,7 @@ export function createChessApp(): void {
 
   function commitMove(moveCommand: AiMoveCommand): boolean {
     const movingColor = game.turn();
+    const clockSnapshot = { ...clockMs };
 
     if (!flushClockElapsed()) {
       return false;
@@ -484,6 +492,7 @@ export function createChessApp(): void {
       return false;
     }
 
+    clockHistory.push(clockSnapshot);
     clockMs[movingColor] += CLOCK_PRESETS[clockPreset].incrementMs;
     restartClockForCurrentTurn();
 
@@ -511,7 +520,17 @@ export function createChessApp(): void {
     const aiColor = game.turn();
     const remainingMs = clockMs[aiColor];
     const incrementMs = CLOCK_PRESETS[clockPreset].incrementMs;
-    const targetMs = remainingMs / 30 + incrementMs * 0.8;
+
+    const ply = game.history().length;
+    const hasCastled = game
+      .history({ verbose: true })
+      .some(
+        (move) =>
+          move.color === aiColor && (move.isKingsideCastle() || move.isQueensideCastle()),
+      );
+    const factor = openingTimeFactor(ply, hasCastled);
+
+    const targetMs = (remainingMs / 30) * factor + incrementMs * 0.8;
     const timeLimitMs =
       remainingMs <= 3_000 ? Math.min(targetMs, remainingMs * 0.35) : targetMs;
 
@@ -523,6 +542,7 @@ export function createChessApp(): void {
 
   function resetClockState(): void {
     clockMs = createClockState(clockPreset);
+    clockHistory = [];
     timedOutColor = null;
     activeClockColor = null;
     lastClockTick = Date.now();
@@ -1088,6 +1108,24 @@ function createClockState(preset: ClockPreset): Record<Color, number> {
   const baseMs = CLOCK_PRESETS[preset].baseMs;
 
   return { w: baseMs, b: baseMs };
+}
+
+// Opening moves rarely benefit from deep search, so spend less of the clock early
+// and ramp back to the full budget by OPENING_FULL_PLY. The ramp is geometric rather
+// than linear — the earliest moves are held down harder and the factor accelerates
+// toward 1.0 — because deep search has the least marginal value at the very start.
+// Castling marks the opening as effectively over (king safety + development done), so
+// it returns the full budget immediately, while the ply ramp still covers games where
+// castling never happens.
+function openingTimeFactor(ply: number, hasCastled: boolean): number {
+  if (hasCastled) {
+    return 1;
+  }
+
+  const progress = Math.min(ply / OPENING_FULL_PLY, 1);
+
+  // Geometric interpolation from OPENING_MIN_FACTOR (progress 0) to 1.0 (progress 1).
+  return OPENING_MIN_FACTOR ** (1 - progress);
 }
 
 function isSameMoveCommand(move: Move, command: AiMoveCommand): boolean {
